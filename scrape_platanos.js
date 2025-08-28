@@ -1,23 +1,24 @@
 // scrape_platanos.js — Importa productes de platanosneaker.com a Postgres (Railway)
-// Ús: crea un servei Railway temporal amb Start Command = "node scrape_platanos.js"
+// Start Command del servei: node scrape_platanos.js
 import 'dotenv/config';
 import axios from 'axios';
 import * as cheerio from 'cheerio';
 import pkg from 'pg';
+
 const { Pool } = pkg;
 
-/* ─────────────────────────────────────────
-   Config
-   ───────────────────────────────────────── */
+/* ─────────────────────────────
+   Config bàsica
+   ───────────────────────────── */
 const BASE = 'https://platanosneaker.com';
-const MAX_PAGES_TO_VISIT = 300;     // límit de seguretat per no arrasar
-const CONCURRENCY = 4;              // # descarregues simultànies
-const DEFAULT_STOCK = 999;          // stock per defecte si no hi ha info
-const DEFAULT_OPTION_NAME = 'Talla';// nom de variant per defecte
+const MAX_PAGES = 300;          // límit de seguretat
+const CONCURRENCY = 4;          // fitxes en paral·lel
+const DEFAULT_STOCK = 999;
+const DEFAULT_OPTION_NAME = 'Talla';
 
-/* ─────────────────────────────────────────
+/* ─────────────────────────────
    Postgres
-   ───────────────────────────────────────── */
+   ───────────────────────────── */
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.PGSSLMODE === 'require' ? { rejectUnauthorized: false } : false
@@ -65,9 +66,9 @@ async function upsertVariant({ product_id, option_name, option_value, price_cent
   );
 }
 
-/* ─────────────────────────────────────────
+/* ─────────────────────────────
    Helpers scraper
-   ───────────────────────────────────────── */
+   ───────────────────────────── */
 function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
 
 function priceToCents(txt) {
@@ -86,9 +87,6 @@ async function fetchHtml(url) {
   return cheerio.load(data);
 }
 
-/* ─────────────────────────────────────────
-   Detecció i parse de PRODUCTE
-   ───────────────────────────────────────── */
 function isProductUrl(url) {
   try {
     const u = new URL(url);
@@ -96,20 +94,117 @@ function isProductUrl(url) {
   } catch { return false; }
 }
 
+/* ─────────────────────────────
+   Parse d’una fitxa de producte
+   ───────────────────────────── */
 async function parseProduct(url) {
   const $ = await fetchHtml(url);
 
-  // NOM del producte (WooCommerce sovint usa h1.product_title; si no, agafem el primer h1)
   const name =
     $('h1.product_title').first().text().trim() ||
     $('h1').first().text().trim();
 
-  // DESCRIPCIÓ (breu, si existeix)
   const description =
     $('.woocommerce-product-details__short-description').text().trim() ||
     $('.summary .woocommerce-product-details__short-description').text().trim() ||
     '';
 
-  // PREU (p.price o .summary .price) — agafem el preu "actual"
   let priceTxt =
-    $
+    $('.summary .price').first().text().trim() ||
+    $('p.price').first().text().trim() ||
+    ($('body').text().match(/€\s?\d+[.,]\d{2}/)?.[0] || '');
+
+  const price_cents = priceToCents(priceTxt) ?? 0;
+
+  // variants (talles): select/llista/botons
+  const variantOptions = new Set();
+
+  $('select').each((_, el) => {
+    const nameAttr = ($(el).attr('name') || '').toLowerCase();
+    const idAttr = ($(el).attr('id') || '').toLowerCase();
+    const labelTxt = $(`label[for="${$(el).attr('id') || ''}"]`).text().toLowerCase();
+    if ([nameAttr, idAttr, labelTxt].some(s => s.includes('talla') || s.includes('size'))) {
+      $(el).find('option').each((__, op) => {
+        const val = $(op).text().trim();
+        if (val && !/elige|selecciona|limpiar/i.test(val)) variantOptions.add(val);
+      });
+    }
+  });
+
+  $('[class*="variations"] button, [class*="variations"] li, [class*="pa_talla"] li, [class*="pa_size"] li').each((_, el) => {
+    const t = $(el).text().trim();
+    if (t) variantOptions.add(t);
+  });
+
+  const variants = variantOptions.size ? Array.from(variantOptions) : ['Única'];
+
+  return { name, description, price_cents, variants };
+}
+
+/* ─────────────────────────────
+   Crawler: recull enllaços de producte
+   ───────────────────────────── */
+async function crawlAllProductLinks() {
+  const seed = [
+    BASE + '/',
+    BASE + '/collections/',
+    BASE + '/collections/adidas/',
+    BASE + '/collections/dunk-low/',
+    BASE + '/collections/jordan-13/',
+    BASE + '/collections/nike-shox-tl/'
+  ];
+  const toVisit = new Set(seed);
+  const visited = new Set();
+  const productLinks = new Set();
+
+  while (toVisit.size && visited.size < MAX_PAGES) {
+    const url = Array.from(toVisit)[0];
+    toVisit.delete(url);
+    visited.add(url);
+
+    try {
+      const $ = await fetchHtml(url);
+
+      $('a[href]').each((_, a) => {
+        let href = $(a).attr('href') || '';
+        if (!href) return;
+        if (href.startsWith('#') || href.startsWith('mailto:') || href.startsWith('tel:')) return;
+        if (!href.startsWith('http')) {
+          try { href = new URL(href, url).toString(); } catch { return; }
+        }
+        if (!href.includes('platanosneaker.com')) return;
+
+        if (isProductUrl(href)) {
+          productLinks.add(href);
+        } else {
+          const p = new URL(href);
+          if (p.pathname.startsWith('/collections/') || p.pathname === '/' || p.pathname === '/collections/') {
+            if (!visited.has(href)) toVisit.add(href);
+          }
+        }
+      });
+
+      await sleep(150);
+    } catch (e) {
+      console.warn('Error carregant', url, e.message);
+    }
+  }
+
+  return Array.from(productLinks);
+}
+
+/* ─────────────────────────────
+   Execució principal
+   ───────────────────────────── */
+async function run() {
+  console.log('→ Inici import des de', BASE);
+  await ensureSchema();
+
+  const links = await crawlAllProductLinks();
+  console.log(`→ Productes detectats: ${links.length}`);
+
+  let done = 0;
+  let ok = 0;
+  const queue = links.slice();
+
+  async function worker

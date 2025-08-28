@@ -10,7 +10,7 @@ const { Pool } = pkg;
    ========================= */
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: process.env.PGSSLMODE === 'require' ? { rejectUnauthorized: false } : false,
+  ssl: process.env.PGSSLMODE === 'require' ? { rejectUnauthorized: false } : false
 });
 
 async function initDb() {
@@ -52,33 +52,42 @@ async function initDb() {
 }
 
 const db = {
-  listProducts: () =>
-    pool.query('SELECT * FROM products ORDER BY id DESC LIMIT 100').then(r => r.rows),
-
-  listProductsLike: (q) =>
-    pool.query('SELECT * FROM products WHERE name ILIKE $1 ORDER BY id DESC LIMIT 25', [q]).then(r => r.rows),
-
-  getProduct: (id) =>
-    pool.query('SELECT * FROM products WHERE id=$1', [id]).then(r => r.rows[0]),
-
-  getVariantsOfProduct: (pid) =>
-    pool.query('SELECT * FROM variants WHERE product_id=$1 ORDER BY id ASC', [pid]).then(r => r.rows),
-
-  getVariant: (id) =>
-    pool.query('SELECT * FROM variants WHERE id=$1', [id]).then(r => r.rows[0]),
-
-  decStock: (variant_id, qty) =>
-    pool.query('UPDATE variants SET stock = stock - $1 WHERE id=$2 AND stock >= $1', [qty, variant_id]),
-
-  insertOrder: (user_id, username, items_json, total_cents, total_cost_cents) =>
-    pool.query(
+  listProducts: async () => {
+    const r = await pool.query('SELECT * FROM products ORDER BY id DESC LIMIT 100');
+    return r.rows;
+  },
+  listProductsLike: async (q) => {
+    const r = await pool.query('SELECT * FROM products WHERE name ILIKE $1 ORDER BY id DESC LIMIT 25', [q]);
+    return r.rows;
+  },
+  getProduct: async (id) => {
+    const r = await pool.query('SELECT * FROM products WHERE id=$1', [id]);
+    return r.rows[0];
+  },
+  getVariantsOfProduct: async (pid) => {
+    const r = await pool.query('SELECT * FROM variants WHERE product_id=$1 ORDER BY id ASC', [pid]);
+    return r.rows;
+  },
+  getVariant: async (id) => {
+    const r = await pool.query('SELECT * FROM variants WHERE id=$1', [id]);
+    return r.rows[0];
+  },
+  decStock: async (variant_id, qty) => {
+    return pool.query('UPDATE variants SET stock = stock - $1 WHERE id=$2 AND stock >= $1', [qty, variant_id]);
+  },
+  insertOrder: async (user_id, username, items_json, total_cents, total_cost_cents) => {
+    return pool.query(
       'INSERT INTO orders(user_id, username, items_json, total_cents, total_cost_cents) VALUES($1,$2,$3,$4,$5)',
       [user_id, username, items_json, total_cents, total_cost_cents]
-    ),
-
-  insertQuery: (user_id, username, text) =>
-    pool.query('INSERT INTO queries(user_id, username, text) VALUES($1,$2,$3)', [user_id, username, text]),
+    );
+  },
+  insertQuery: async (user_id, username, text) => {
+    return pool.query('INSERT INTO queries(user_id, username, text) VALUES($1,$2,$3)', [user_id, username, text]);
+  }
 };
+
+const toEuro = (cents) =>
+  (cents / 100).toLocaleString('es-ES', { style: 'currency', currency: 'EUR' });
 
 /* =========================
    2) BOT (Telegraf)
@@ -89,14 +98,13 @@ if (!BOT_TOKEN) throw new Error('Falta CUSTOMER_BOT_TOKEN o CLIENT_BOT_TOKEN');
 await initDb();
 const bot = new Telegraf(BOT_TOKEN);
 
-// (Opcional) enviar missatge als admins quan es crea comanda
+// (Opcional) avisar admins en confirmar comanda
 const ADMIN_CHAT_IDS = (process.env.ADMIN_CHAT_IDS || '').split(',').filter(Boolean);
 
+// Sessió simple en memòria
 const sessions = new Map(); // userId -> { step, productId, variantId, cart: [] }
 const getS = (id) => sessions.get(id) || {};
 const setS = (id, s) => sessions.set(id, s);
-
-const toEuro = (cents) => (cents / 100).toLocaleString('es-ES', { style: 'currency', currency: 'EUR' });
 
 /* =========================
    3) HANDLERS
@@ -112,7 +120,7 @@ bot.start((ctx) => {
 bot.hears('🛍️ Catàleg', async (ctx) => {
   const rows = await db.listProducts();
   if (!rows.length) return ctx.reply('Encara no hi ha productes.');
-  const kb = rows.map(p => [Markup.button.callback(`🧩 ${p.name}`, `P_${p.id}`)]);
+  const kb = rows.map((p) => [Markup.button.callback(`🧩 ${p.name}`, `P_${p.id}`)]);
   await ctx.reply('Tria un producte:', Markup.inlineKeyboard(kb));
 });
 
@@ -121,15 +129,15 @@ bot.command('catalog', async (ctx) => bot.emit('hears', '🛍️ Catàleg', ctx)
 bot.hears('🧺 Veure cistella', async (ctx) => {
   const s = getS(ctx.from.id);
   if (!s.cart || !s.cart.length) return ctx.reply('La cistella és buida.');
-  const lines = s.cart.map((it, i) =>
-    `#${i + 1} ${it.productName} — ${it.variantLabel} ×${it.qty} = ${toEuro(it.price_cents * it.qty)}`
+  const lines = s.cart.map(
+    (it, i) => `#${i + 1} ${it.productName} — ${it.variantLabel} ×${it.qty} = ${toEuro(it.price_cents * it.qty)}`
   );
   const total = s.cart.reduce((acc, it) => acc + it.price_cents * it.qty, 0);
   return ctx.reply(
     ['Cistella:', ...lines, `\nTotal: ${toEuro(total)}`].join('\n'),
     Markup.inlineKeyboard([
       [Markup.button.callback('✅ Confirmar comanda', 'CHECKOUT')],
-      [Markup.button.callback('🧹 Buidar cistella', 'CLEAR_CART')],
+      [Markup.button.callback('🧹 Buidar cistella', 'CLEAR_CART')]
     ])
   );
 });
@@ -141,7 +149,7 @@ bot.action(/P_(\d+)/, async (ctx) => {
   if (!p) return ctx.answerCbQuery('Producte no trobat');
   const vs = await db.getVariantsOfProduct(productId);
   if (!vs.length) return ctx.editMessageText(`«${p.name}» encara no té variants.`);
-  const kb = vs.map(v => [
+  const kb = vs.map((v) => [
     Markup.button.callback(`${v.option_value} — ${toEuro(v.price_cents)} (${v.stock} en stock)`, `V_${v.id}`)
   ]);
   await ctx.editMessageText(`Opcions per a «${p.name}»:`, Markup.inlineKeyboard(kb));
@@ -161,7 +169,7 @@ bot.action(/V_(\d+)/, async (ctx) => {
 // Continuar comprant
 bot.action('CONT_SHOP', (ctx) => ctx.reply('Escriu què busques o usa /catalog.'));
 
-// Un sol handler de text: gestiona quantitat o cerca
+// Handler únic de text (gestiona quantitat o cerca)
 bot.on('text', async (ctx) => {
   const s = getS(ctx.from.id);
   const msg = ctx.message.text.trim();
@@ -170,6 +178,7 @@ bot.on('text', async (ctx) => {
   if (s.step === 'ASK_QTY') {
     const qty = Number(msg.replace(/[^0-9]/g, ''));
     if (!qty || qty < 1) return ctx.reply('Posa un número vàlid (1, 2, 3, …)');
+
     const v = await db.getVariant(s.variantId);
     const p = await db.getProduct(s.productId);
     if (!v || !p) return ctx.reply('Ha expirat la selecció. Torna-ho a provar.');
@@ -184,6 +193,7 @@ bot.on('text', async (ctx) => {
       cost_cents: v.cost_cents || 0,
       qty
     };
+
     const cart = (s.cart || []).concat(item);
     setS(ctx.from.id, { step: null, cart });
 
@@ -192,7 +202,7 @@ bot.on('text', async (ctx) => {
       `Afegit a la cistella: ${p.name} — ${v.option_value} ×${qty}.\nTotal actual: ${toEuro(total)}`,
       Markup.inlineKeyboard([
         [Markup.button.callback('🧺 Veure/Confirmar', 'CHECKOUT')],
-        [Markup.button.callback('🛍️ Continuar comprant', 'CONT_SHOP')],
+        [Markup.button.callback('🛍️ Continuar comprant', 'CONT_SHOP')]
       ])
     );
   }
@@ -202,7 +212,7 @@ bot.on('text', async (ctx) => {
   await db.insertQuery(ctx.from.id, ctx.from.username || '', msg);
   const rows = await db.listProductsLike(`%${msg}%`);
   if (!rows.length) return ctx.reply('No he trobat res amb aquesta cerca. Prova un altre nom o usa /catalog.');
-  const kb = rows.map(p => [Markup.button.callback(`🧩 ${p.name}`, `P_${p.id}`)]);
+  const kb = rows.map((p) => [Markup.button.callback(`🧩 ${p.name}`, `P_${p.id}`)]);
   return ctx.reply('He trobat això. Tria un producte:', Markup.inlineKeyboard(kb));
 });
 
@@ -227,11 +237,11 @@ bot.action('CHECKOUT', async (ctx) => {
 
   await ctx.editMessageText(`✅ Comanda registrada! Total: ${toEuro(total)}. Ens posarem en contacte.`);
 
-  // Notificació opcional a admins (si s'han definit)
+  // Notificació opcional a admins
   if (ADMIN_CHAT_IDS.length) {
     const msg = `📦 Nova comanda de @${ctx.from.username || 'usuari'} (${ctx.from.id}) — Total ${toEuro(total)}`;
     for (const chatId of ADMIN_CHAT_IDS) {
-      try { await bot.telegram.sendMessage(chatId, msg); } catch {}
+      try { await bot.telegram.sendMessage(chatId, msg); } catch (e) { /* ignore */ }
     }
   }
 });
@@ -244,7 +254,7 @@ bot.action('CLEAR_CART', (ctx) => {
 // Errors
 bot.catch((err, ctx) => {
   console.error('Bot error', err);
-  ctx.reply('Sembla que hi ha hagut un error. Torna-ho a provar.');
+  try { ctx.reply('Sembla que hi ha hagut un error. Torna-ho a provar.'); } catch (e) {}
 });
 
 /* =========================
@@ -269,9 +279,4 @@ if (USE_WEBHOOK) {
 }
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
-
-}
-process.once('SIGINT', () => bot.stop('SIGINT'));
-
 process.once('SIGTERM', () => bot.stop('SIGTERM'));

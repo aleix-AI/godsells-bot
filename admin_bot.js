@@ -1,36 +1,24 @@
-// admin_bot.js — Telegraf + PostgreSQL + Webhook (Railway-ready)
+// admin_bot.js — Telegraf + PostgreSQL + Webhook (Categories/Marques + /autotag)
 import 'dotenv/config';
 import { Telegraf, Markup } from 'telegraf';
 import pkg from 'pg';
-
 const { Pool } = pkg;
 
-/* DB (PG) */
+/* DB */
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.PGSSLMODE === 'require' ? { rejectUnauthorized: false } : false
 });
 
-async function initDb() {
+async function ensureSchema() {
+  // Afegim brand/category si no existeixen
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS products(
-      id SERIAL PRIMARY KEY, name TEXT NOT NULL, description TEXT DEFAULT '', created_at TIMESTAMPTZ DEFAULT now()
-    );
-    CREATE TABLE IF NOT EXISTS variants(
-      id SERIAL PRIMARY KEY, product_id INT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
-      option_name TEXT DEFAULT 'variant', option_value TEXT NOT NULL,
-      price_cents INT NOT NULL, cost_cents INT DEFAULT 0, stock INT DEFAULT 0, created_at TIMESTAMPTZ DEFAULT now()
-    );
-    CREATE TABLE IF NOT EXISTS orders(
-      id SERIAL PRIMARY KEY, user_id BIGINT, username TEXT,
-      items_json JSONB NOT NULL, total_cents INT NOT NULL, total_cost_cents INT DEFAULT 0,
-      status TEXT DEFAULT 'PENDING', created_at TIMESTAMPTZ DEFAULT now()
-    );
-    CREATE TABLE IF NOT EXISTS queries(
-      id SERIAL PRIMARY KEY, user_id BIGINT, username TEXT, text TEXT, created_at TIMESTAMPTZ DEFAULT now()
-    );
+    ALTER TABLE products ADD COLUMN IF NOT EXISTS brand TEXT;
+    ALTER TABLE products ADD COLUMN IF NOT EXISTS category TEXT;
   `);
 }
+
+await ensureSchema();
 
 const db = {
   insertProduct: async (name, description='') =>
@@ -48,7 +36,56 @@ const db = {
                                SUM(total_cents) AS rev,
                                SUM(total_cost_cents) AS cog,
                                SUM(total_cents-total_cost_cents) AS margin
-                        FROM orders GROUP BY 1 ORDER BY 1 DESC LIMIT 30`)).rows
+                        FROM orders GROUP BY 1 ORDER BY 1 DESC LIMIT 30`)).rows,
+  autotag: async () => {
+    // BRAND heurístic
+    await pool.query(`
+      UPDATE products SET brand = 'Nike'
+      WHERE brand IS NULL OR brand = '' AND name ~* '(\\bNike\\b|Air\\s?Force|Dunk|Pegasus|P-?6000|P\\s?6000|Cortez|TN\\b)';
+    `);
+    await pool.query(`
+      UPDATE products SET brand = 'Adidas'
+      WHERE (brand IS NULL OR brand = '') AND name ~* '(\\bAdidas\\b|Samba|Gazelle|Campus|Superstar|Forum|Stan\\s?Smith|Yeezy)';
+    `);
+    await pool.query(`
+      UPDATE products SET brand = 'Jordan'
+      WHERE (brand IS NULL OR brand = '') AND name ~* '(\\bJordan\\b|AJ\\s?\\d)';
+    `);
+    await pool.query(`
+      UPDATE products SET brand = 'New Balance'
+      WHERE (brand IS NULL OR brand = '') AND name ~* '(New\\s?Balance|\\bNB\\b|\\bNB\\s?\\d{3}\\b|550|530|2002R|990|991|992)';
+    `);
+    await pool.query(`
+      UPDATE products SET brand = 'ASICS'
+      WHERE (brand IS NULL OR brand = '') AND name ~* '(ASICS|Gel[-\\s]?)';
+    `);
+    await pool.query(`
+      UPDATE products SET brand = 'Puma'
+      WHERE (brand IS NULL OR brand = '') AND name ~* '(\\bPuma\\b|Suede|RS-?X)';
+    `);
+    await pool.query(`
+      UPDATE products SET brand = 'Reebok'
+      WHERE (brand IS NULL OR brand = '') AND name ~* '(Reebok|Club\\s?C|Classic)';
+    `);
+
+    // CATEGORY heurístic molt simple
+    await pool.query(`
+      UPDATE products p
+      SET category = 'Roba'
+      WHERE (p.category IS NULL OR p.category = '')
+        AND p.name ~* '(hoodie|sudadera|chaqueta|cazadora|pantal(|ó|o)n|short|camiseta|t-?shirt|tee|jacket|jersey|chandal|tracksuit|top|socks|calcetines)';
+    `);
+    await pool.query(`
+      UPDATE products p
+      SET category = 'Sabates'
+      WHERE (p.category IS NULL OR p.category = '')
+    `);
+
+    // retorna resum
+    const brands = (await pool.query(`SELECT COALESCE(brand,'(sense)') b, COUNT(*) n FROM products GROUP BY 1 ORDER BY n DESC LIMIT 20`)).rows;
+    const cats = (await pool.query(`SELECT COALESCE(category,'(sense)') c, COUNT(*) n FROM products GROUP BY 1 ORDER BY n DESC`)).rows;
+    return { brands, cats };
+  }
 };
 
 /* BOT */
@@ -56,17 +93,15 @@ const ADMIN_BOT_TOKEN = process.env.ADMIN_BOT_TOKEN;
 const ADMIN_IDS = (process.env.ADMIN_IDS || '').toString().split(',').filter(Boolean);
 if (!ADMIN_BOT_TOKEN) throw new Error('Falta ADMIN_BOT_TOKEN');
 
-await initDb();
 const admin = new Telegraf(ADMIN_BOT_TOKEN);
 const isAdmin = (ctx) => ADMIN_IDS.includes(String(ctx.from.id));
 
-/* HANDLERS */
 admin.start((ctx) => {
   if (!isAdmin(ctx)) return ctx.reply('No autoritzat.');
-  ctx.reply('🛠️ Admin bot', Markup.keyboard([
+  ctx.reply('🛠️ Admin', Markup.keyboard([
     ['➕ Afegir producte','🧩 Llistar productes'],
     ['📦 Llistar comandes','📝 Consultes clients'],
-    ['📊 Balanç (30 dies)']
+    ['📊 Balanç (30 dies)','🏷️ /autotag']
   ]).resize());
 });
 
@@ -74,55 +109,21 @@ admin.hears('🧩 Llistar productes', async (ctx) => {
   if (!isAdmin(ctx)) return;
   const rows = await db.listProducts();
   if (!rows.length) return ctx.reply('No hi ha productes.');
-  ctx.reply(rows.map(p=>`#${p.id} — ${p.name}`).join('\n'));
+  ctx.reply(rows.map(p => `#${p.id} — ${p.name} ${p.brand?`(${p.brand})`:''} ${p.category?`[${p.category}]`:''}`).join('\n').slice(0,4000));
 });
 
 admin.hears('📦 Llistar comandes', async (ctx) => {
   if (!isAdmin(ctx)) return;
   const rows = await db.listOrders();
   if (!rows.length) return ctx.reply('Encara no hi ha comandes.');
-  ctx.reply(rows.map(o=>`#${o.id} — ${new Date(o.created_at).toLocaleString('es-ES')} — ${o.username || o.user_id} — ${(o.total_cents/100).toFixed(2)} €`).join('\n'));
+  ctx.reply(rows.map(o => `#${o.id} — ${new Date(o.created_at).toLocaleString('es-ES')} — ${o.username || o.user_id} — ${(o.total_cents/100).toFixed(2)} €`).join('\n').slice(0,4000));
 });
 
 admin.hears('📝 Consultes clients', async (ctx) => {
   if (!isAdmin(ctx)) return;
   const rows = await db.listQueries();
   if (!rows.length) return ctx.reply('Sense consultes.');
-  ctx.reply(rows.slice(0,30).map(q=>`${new Date(q.created_at).toLocaleString('es-ES')} — ${q.username || q.user_id}: ${q.text}`).join('\n'));
-});
-
-admin.hears('➕ Afegir producte', (ctx) => {
-  if (!isAdmin(ctx)) return;
-  ctx.reply('Envia: Nom | Descripció opcional');
-  admin.once('text', async (ctx2) => {
-    if (!isAdmin(ctx2)) return;
-    const [name, ...rest] = ctx2.message.text.split('|').map(s=>s.trim());
-    if (!name) return ctx2.reply('Nom requerit.');
-    const { id } = await db.insertProduct(name, rest.join(' | ') || '');
-    ctx2.reply(`✅ Producte #${id} creat. Ara /addvariant`);
-  });
-});
-
-admin.command('addvariant', (ctx) => {
-  if (!isAdmin(ctx)) return;
-  ctx.reply('Format: productId | Variant | Valor | Preu € | Stock | Cost € (opcional)');
-});
-
-admin.on('text', async (ctx, next) => {
-  if (!isAdmin(ctx)) return;
-  const t = ctx.message.text;
-  if (!t.includes('|')) return next();
-  const parts = t.split('|').map(s=>s.trim());
-  if (parts.length >= 5 && /^\d+$/.test(parts[0])) {
-    const [pid, opt, val, priceEur, stockStr, costEur] = parts;
-    const price_cents = Math.round(parseFloat((priceEur||'0').replace(',','.'))*100);
-    const stock = parseInt(stockStr||'0',10);
-    const cost_cents = costEur ? Math.round(parseFloat(costEur.replace(',','.'))*100) : 0;
-    if (Number.isNaN(price_cents) || Number.isNaN(stock) || Number.isNaN(cost_cents)) return ctx.reply('Preu/stock/cost invàlids.');
-    const { id } = await db.insertVariant(Number(pid), opt, val, price_cents, stock, cost_cents);
-    return ctx.reply(`✅ Variant #${id} a prod ${pid}: ${opt}=${val} (${(price_cents/100).toFixed(2)} €, cost ${(cost_cents/100).toFixed(2)} €, stock ${stock})`);
-  }
-  return next();
+  ctx.reply(rows.slice(0,30).map(q => `${new Date(q.created_at).toLocaleString('es-ES')} — ${q.username || q.user_id}: ${q.text}`).join('\n'));
 });
 
 admin.hears('📊 Balanç (30 dies)', async (ctx) => {
@@ -136,10 +137,24 @@ admin.hears('📊 Balanç (30 dies)', async (ctx) => {
   }).join('\n'));
 });
 
+// /autotag — omple brand/category
+admin.command('autotag', async (ctx) => {
+  if (!isAdmin(ctx)) return;
+  await ctx.reply('🏷️ Classificant marques i categories…');
+  const { brands, cats } = await db.autotag();
+  await ctx.reply([
+    '✅ Fet!',
+    '— Marques top:',
+    ...brands.slice(0,10).map(b=>`• ${b.b}: ${b.n}`),
+    '— Categories:',
+    ...cats.map(c=>`• ${c.c}: ${c.n}`)
+  ].join('\n'));
+});
+
 /* ARRANQUE (Webhook o Polling) */
 const USE_WEBHOOK = String(process.env.USE_WEBHOOK).toLowerCase() === 'true';
 const PORT = Number(process.env.PORT || 3000);
-const APP_URL = process.env.APP_URL;     // Domini públic d’AQUEST servei admin
+const APP_URL = process.env.APP_URL;
 const HOOK_PATH = process.env.HOOK_PATH || '/tghook';
 
 if (USE_WEBHOOK) {

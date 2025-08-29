@@ -1,4 +1,4 @@
-// customer_bot.js — Catàleg per Categories/Marques + Paginació + flux compra polit
+// customer_bot.js — Categories/Marques amb o sense emoji + flux compra + cap menció d'admin
 import 'dotenv/config';
 import { Telegraf, Markup } from 'telegraf';
 import pkg from 'pg';
@@ -11,10 +11,8 @@ const pool = new Pool({
 });
 
 async function ensureSchema() {
-  await pool.query(`
-    ALTER TABLE products ADD COLUMN IF NOT EXISTS brand TEXT;
-    ALTER TABLE products ADD COLUMN IF NOT EXISTS category TEXT;
-  `);
+  await pool.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS brand TEXT;`);
+  await pool.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS category TEXT;`);
 }
 await ensureSchema();
 
@@ -51,39 +49,47 @@ const BOT_TOKEN = process.env.CUSTOMER_BOT_TOKEN || process.env.CLIENT_BOT_TOKEN
 if (!BOT_TOKEN) throw new Error('Falta CUSTOMER_BOT_TOKEN o CLIENT_BOT_TOKEN');
 
 const bot = new Telegraf(BOT_TOKEN);
-const sessions = new Map(); // userId -> { step, productId, variantId, cart: [] }
+const sessions = new Map();
 const getS = (id) => sessions.get(id) || {};
 const setS = (id, s) => sessions.set(id, s);
-const toEuro = (cents) => (cents/100).toLocaleString('es-ES',{style:'currency',currency:'EUR'});
+const toEuro = (c) => (c/100).toLocaleString('es-ES',{style:'currency',currency:'EUR'});
 const PAGE = 10;
 const enc = (s) => encodeURIComponent(s || '');
 const dec = (s) => decodeURIComponent(s || '');
 
-// ===== Menús principals =====
+/* ===== Menú ===== */
 bot.start((ctx) => {
   setS(ctx.from.id, {});
   ctx.reply(
-    '👋 Benvingut/da! Pots cercar escrivint (ex: "samba") o navegar:',
+    '👋 Benvingut/da! Pots cercar escrivint (ex: "samba") o navegar pel catàleg:',
     Markup.keyboard([['📂 Categories','🏷️ Marques'],['🧺 Veure cistella']]).resize()
   );
 });
+bot.command('categories', (ctx)=> bot.emit('hears','📂 Categories',ctx));
+bot.command('marques',    (ctx)=> bot.emit('hears','🏷️ Marques',ctx));
+bot.command('cistella',   (ctx)=> bot.emit('hears','🧺 Veure cistella',ctx));
 
-bot.hears('📂 Categories', async (ctx) => {
+/* Accepta amb i sense emoji (i indiferent a majúscules) */
+const mktest = (t) => (s) => new RegExp(`^(${t}|.*${t.replace(/\s+/g,'.*')}).*$`,'i').test(s);
+const isCat    = mktest('categories');
+const isBrand  = mktest('marques');
+const isCart   = mktest('veure\\s+cistella');
+
+bot.hears([/📂\s*Categories/i, isCat], async (ctx) => {
   const cats = await db.topCategories();
-  if (!cats.length) return ctx.reply('Encara no hi ha categories. (Executa /autotag a l’admin)');
+  if (!cats.length) return ctx.reply('Encara no hi ha categories disponibles.');
   const kb = cats.map(c => [Markup.button.callback(`${c.category} (${c.n})`, `CAT|${enc(c.category)}|0`)]);
   await ctx.reply('Tria una categoria:', Markup.inlineKeyboard(kb));
 });
 
-bot.hears('🏷️ Marques', async (ctx) => {
+bot.hears([/🏷️\s*Marques/i, isBrand], async (ctx) => {
   const brs = await db.topBrands();
-  if (!brs.length) return ctx.reply('Encara no hi ha marques. (Executa /autotag a l’admin)');
-  const rows = [];
-  for (const b of brs) rows.push([Markup.button.callback(`${b.brand} (${b.n})`, `BRAND|${enc(b.brand)}|0`)]);
+  if (!brs.length) return ctx.reply('Encara no hi ha marques disponibles.');
+  const rows = brs.map(b => [Markup.button.callback(`${b.brand} (${b.n})`, `BRAND|${enc(b.brand)}|0`)]);
   await ctx.reply('Tria una marca:', Markup.inlineKeyboard(rows));
 });
 
-bot.hears('🧺 Veure cistella', (ctx) => {
+bot.hears([/🧺\s*Veure\s*Cistella/i, isCart], (ctx) => {
   const s = getS(ctx.from.id);
   if (!s.cart || !s.cart.length) return ctx.reply('La cistella és buida.');
   const lines = s.cart.map((it,i)=>`#${i+1} ${it.productName} — ${it.variantLabel} ×${it.qty} = ${toEuro(it.price_cents*it.qty)}`);
@@ -95,13 +101,13 @@ bot.hears('🧺 Veure cistella', (ctx) => {
     ]));
 });
 
-// ===== Paginació per Categoria/Marca =====
+/* ===== Paginació llistes ===== */
 async function renderList(ctx, mode, value, page) {
   const offset = page*PAGE;
   let total=0, rows=[];
   if (mode==='CAT') { total = await db.countByCategory(value); rows = await db.pageByCategory(value,PAGE,offset); }
   if (mode==='BRAND') { total = await db.countByBrand(value); rows = await db.pageByBrand(value,PAGE,offset); }
-  if (!rows.length) return ctx.answerCbQuery('Sense productes', { show_alert:false });
+  if (!rows.length) return ctx.answerCbQuery('Sense productes');
 
   const pages = Math.max(1, Math.ceil(total/PAGE));
   const items = rows.map(p => [Markup.button.callback(`🧩 ${p.name}`, `P_${p.id}`)]);
@@ -112,38 +118,31 @@ async function renderList(ctx, mode, value, page) {
   items.push(nav);
   const title = mode==='CAT' ? `Categoria: ${value}` : `Marca: ${value}`;
 
-  try {
-    await ctx.editMessageText(`${title}\nTria un producte:`, Markup.inlineKeyboard(items));
-  } catch {
-    await ctx.reply(`${title}\nTria un producte:`, Markup.inlineKeyboard(items));
-  }
+  try { await ctx.editMessageText(`${title}\nTria un producte:`, Markup.inlineKeyboard(items)); }
+  catch { await ctx.reply(`${title}\nTria un producte:`, Markup.inlineKeyboard(items)); }
 }
-
 bot.action(/^(CAT|BRAND)\|(.+)\|(\d+)$/, async (ctx) => {
-  const mode = ctx.match[1];
-  const value = dec(ctx.match[2]);
-  const page = Number(ctx.match[3]);
-  await ctx.answerCbQuery();
-  return renderList(ctx, mode, value, page);
+  const mode = ctx.match[1]; const value = decodeURIComponent(ctx.match[2]); const page = Number(ctx.match[3]);
+  await ctx.answerCbQuery(); return renderList(ctx, mode, value, page);
 });
-
 bot.action('NOOP', (ctx)=>ctx.answerCbQuery());
 
-// ===== Cerca lliure =====
+/* ===== Cerca lliure (si no estem demanant quantitat) ===== */
 bot.on('text', async (ctx, next) => {
   const s = getS(ctx.from.id);
-  if (s.step === 'ASK_QTY') return next(); // el següent handler gestiona la quantitat
+  if (s.step === 'ASK_QTY') return next();
 
   const q = ctx.message.text.trim();
-  if (['📂 Categories','🏷️ Marques','🧺 Veure cistella'].includes(q)) return;
+  if (isCat(q) || isBrand(q) || isCart(q)) return; // ja cobert pels hears
   await db.insertQuery(ctx.from.id, ctx.from.username||'', q);
+
   const rows = await db.listProductsLike(`%${q}%`);
-  if (!rows.length) return ctx.reply('No he trobat res amb aquesta cerca. Prova una altra paraula o obre 📂 Categories / 🏷️ Marques.');
+  if (!rows.length) return ctx.reply('No he trobat res amb aquesta cerca. Prova una altra paraula o obre el catàleg.');
   const kb = rows.map(p => [Markup.button.callback(`🧩 ${p.name}`, `P_${p.id}`)]);
   await ctx.reply('He trobat això. Tria un producte:', Markup.inlineKeyboard(kb));
 });
 
-// ===== Producte → Variants → Quantitat =====
+/* ===== Producte → Variants → Quantitat ===== */
 bot.action(/P_(\d+)/, async (ctx) => {
   await ctx.answerCbQuery();
   const productId = Number(ctx.match[1]);
@@ -151,15 +150,10 @@ bot.action(/P_(\d+)/, async (ctx) => {
   if (!p) return ctx.answerCbQuery('Producte no trobat');
 
   const vs = await db.getVariantsOfProduct(productId);
-  if (!vs.length) {
-    return ctx.reply(`«${p.name}» ara mateix no té variants disponibles.`);
-  }
+  if (!vs.length) return ctx.reply(`«${p.name}» no té variants disponibles ara mateix.`);
   const kb = vs.map(v => [Markup.button.callback(`${v.option_value} — ${toEuro(v.price_cents)} (${v.stock} stock)`, `V_${v.id}`)]);
-  try {
-    await ctx.editMessageText(`Opcions per a «${p.name}»:`, Markup.inlineKeyboard(kb));
-  } catch {
-    await ctx.reply(`Opcions per a «${p.name}»:`, Markup.inlineKeyboard(kb));
-  }
+  try { await ctx.editMessageText(`Opcions per a «${p.name}»:`, Markup.inlineKeyboard(kb)); }
+  catch { await ctx.reply(`Opcions per a «${p.name}»:`, Markup.inlineKeyboard(kb)); }
 });
 
 bot.action(/V_(\d+)/, async (ctx) => {
@@ -173,10 +167,10 @@ bot.action(/V_(\d+)/, async (ctx) => {
   await ctx.reply(`Quantes unitats vols de «${p.name} — ${v.option_value}»? Escriu un número (stock: ${v.stock}).`);
 });
 
-// Handler exclusiu quantitat
+/* ===== Demanar quantitat ===== */
 bot.on('text', async (ctx) => {
   const s = getS(ctx.from.id);
-  if (s.step !== 'ASK_QTY') return; // altres textos ja tractats abans
+  if (s.step !== 'ASK_QTY') return;
   const qty = Number(ctx.message.text.replace(/[^0-9]/g,''));
   if (!qty || qty < 1) return ctx.reply('Posa un número vàlid (1, 2, 3, …)');
 
@@ -199,18 +193,15 @@ bot.on('text', async (ctx) => {
   );
 });
 
-// ===== Checkout / Cistella =====
+/* ===== Checkout / Cistella ===== */
 bot.action('CHECKOUT', async (ctx) => {
   await ctx.answerCbQuery();
   const s = getS(ctx.from.id);
   if (!s.cart || !s.cart.length) return ctx.reply('Cistella buida.');
 
-  // Descompte de stock
   for (const it of s.cart) {
     const res = await db.decStock(it.variantId, it.qty);
-    if (res.rowCount === 0) {
-      return ctx.reply(`Sense stock suficient per ${it.productName} — ${it.variantLabel}. Actualitza la cistella.`);
-    }
+    if (res.rowCount === 0) return ctx.reply(`Sense stock suficient per ${it.productName} — ${it.variantLabel}.`);
   }
 
   const total = s.cart.reduce((a,it)=>a+it.price_cents*it.qty,0);
@@ -229,13 +220,9 @@ bot.action('CLEAR_CART', async (ctx) => {
   catch { await ctx.reply('🧹 Cistella buidada.'); }
 });
 
-// Errors
-bot.catch((err, ctx) => {
-  console.error('Bot error', err);
-  try { ctx.reply('Sembla que hi ha hagut un error. Torna-ho a provar.'); } catch {}
-});
+bot.catch((err, ctx) => { console.error('Customer bot error', err); try { ctx.reply('Sembla que hi ha hagut un error.'); } catch {} });
 
-/* ARRANQUE (Webhook o Polling) */
+/* ARRANQUE */
 const USE_WEBHOOK = String(process.env.USE_WEBHOOK).toLowerCase() === 'true';
 const PORT = Number(process.env.PORT || 3000);
 const APP_URL = process.env.APP_URL;

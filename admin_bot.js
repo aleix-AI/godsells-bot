@@ -61,8 +61,7 @@ admin.hears('📦 Comandes pendents', async (ctx) => {
   const text = rows
     .map(
       (o) =>
-        `#${o.id} — ${new Date(o.created_at).toLocaleString('es-ES')} — ${o.customer_name || o.username || o.user_id
-        } — ${toEuro(o.total_cents)} — ${o.status}`
+        `#${o.id} — ${new Date(o.created_at).toLocaleString('es-ES')} — ${o.customer_name || o.username || o.user_id} — ${toEuro(o.total_cents)} — ${o.status}`
     )
     .join('\n')
     .slice(0, 4000);
@@ -93,38 +92,32 @@ async function notifyNewOrders() {
 
     for (const o of rows) {
       let items = [];
-      try {
-        items = JSON.parse(o.items_json || '[]');
-      } catch {
-        items = [];
-      }
+      try { items = JSON.parse(o.items_json || '[]'); } catch { items = []; }
 
-      const lines = items
-        .map((it) => {
-          const qty = it.qty || 1;
-          const line = (it.price_cents || 0) * qty;
-          return `• ${it.productName} — talla ${it.size} ×${qty} — ${toEuro(line)}`;
-        })
-        .join('\n');
+      // Línies d'articles
+      let lines = '';
+      for (const it of items) {
+        const qty = it.qty || 1;
+        const lineTotal = (it.price_cents || 0) * qty;
+        lines += `• ${it.productName} — talla ${it.size} ×${qty} — ${toEuro(lineTotal)}\n`;
+      }
+      if (!lines) lines = '(buit)\n';
 
       const who = o.customer_name || (o.username ? `@${o.username}` : `${o.user_id}`);
 
-      const msg = [
-        `🆕 NOVA COMANDA #${o.id}`,
-        `👤 Client: ${who}`,
-        `🔗 Usuari: ${o.username ? '@' + o.username : o.user_id}`,
-        `📍 Adreça:\n${o.address_text || '(no informada)'}`,
-        ``,
-        `📦 Productes:`,
-        lines || '(buit)',
-        ``,
-        `💶 Total: ${toEuro(o.total_cents)}`,
-        `🕒 ${new Date(o.created_at).toLocaleString('es-ES')}`
-      ].join('\n');
+      // Missatge en text pla (sense Markdown/HTML)
+      let msg = '';
+      msg += `🆕 NOVA COMANDA #${o.id}\n`;
+      msg += `👤 Client: ${who}\n`;
+      msg += `🔗 Usuari: ${o.username ? '@' + o.username : o.user_id}\n`;
+      msg += `📍 Adreça:\n${o.address_text || '(no informada)'}\n\n`;
+      msg += `📦 Productes:\n${lines}\n`;
+      msg += `💶 Total: ${toEuro(o.total_cents)}\n`;
+      msg += `🕒 ${new Date(o.created_at).toLocaleString('es-ES')}`;
 
       for (const aid of ADMIN_IDS) {
         try {
-          await admin.telegram.sendMessage(aid, msg); // text pla, sense parse_mode
+          await admin.telegram.sendMessage(aid, msg); // text pla
         } catch (e) {
           console.error(`Send fail to ${aid}`, e.message);
         }
@@ -166,12 +159,5 @@ if (USE_WEBHOOK) {
   console.log('Admin bot running (long polling)');
 }
 
-process.once('SIGINT', () => {
-  try { admin.stop('SIGINT'); } catch {}
-});
-process.once('SIGTERM', () => {
-  try { admin.stop('SIGTERM'); } catch {}
-});
-
-      ].join('\n');
-
+process.once('SIGINT', () => { try { admin.stop('SIGINT'); } catch {} });
+process.once('SIGTERM', () => { try { admin.stop('SIGTERM'); } catch {} });

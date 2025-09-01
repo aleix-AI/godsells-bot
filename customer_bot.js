@@ -1,4 +1,4 @@
-// customer_bot.js — Perfil persistent (nom + adreça), talla per text, preu amb fallback
+// customer_bot.js — Cistella editable, talla per text, perfil persistent i flux net
 import 'dotenv/config';
 import { Telegraf, Markup } from 'telegraf';
 import pkg from 'pg';
@@ -21,8 +21,6 @@ async function ensureSchema() {
   await pool.query(`ALTER TABLE orders   ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'PENDING';`);
   await pool.query(`ALTER TABLE orders   ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT now();`);
   await pool.query(`ALTER TABLE orders   ADD COLUMN IF NOT EXISTS notified_at TIMESTAMPTZ;`);
-
-  // Perfil persistent del client
   await pool.query(`
     CREATE TABLE IF NOT EXISTS customers(
       user_id BIGINT PRIMARY KEY,
@@ -56,7 +54,7 @@ const db = {
   minPriceForProduct: async (pid) =>
     Number((await pool.query(`SELECT MIN(price_cents) AS min FROM variants WHERE product_id=$1`,[pid])).rows[0]?.min || 0),
 
-  // comandes
+  // comandes i consultes
   insertOrder: async (o) =>
     pool.query(
       `INSERT INTO orders(user_id, username, items_json, total_cents, total_cost_cents, customer_name, address_text, status)
@@ -118,7 +116,6 @@ bot.command('marques',    (ctx)=> bot.emit('hears','🏷️ Marques',ctx));
 bot.command('cistella',   (ctx)=> bot.emit('hears','🧺 Veure cistella',ctx));
 bot.command('dades',      (ctx)=> bot.emit('hears','👤 Dades d’enviament',ctx));
 
-/* Accepta sense emoji / majúscules */
 const isCat   = (s) => /^(\p{Emoji_Presentation}?\s*)?categories$/iu.test(s.trim());
 const isBrand = (s) => /^(\p{Emoji_Presentation}?\s*)?marques$/iu.test(s.trim());
 const isCart  = (s) => /^(\p{Emoji_Presentation}?\s*)?veure\s+cistella$/iu.test(s.trim());
@@ -137,10 +134,10 @@ bot.hears([/🏷️\s*Marques/i, isBrand], async (ctx) => {
   const rows = brs.map(b => [Markup.button.callback(`${b.brand} (${b.n})`, `BRAND|${enc(b.brand)}|0`)]);
   await ctx.reply('Tria una marca:', Markup.inlineKeyboard(rows));
 });
-
 bot.hears([/🧺\s*Veure\s*Cistella/i, isCart], (ctx) => showCart(ctx));
 bot.hears([/👤\s*Dades d.?enviament/i, isAddr], (ctx) => showOrEditProfile(ctx, true));
 
+/* Llistes amb paginació */
 async function renderList(ctx, mode, value, page) {
   const offset = page*PAGE;
   let total=0, rows=[];
@@ -165,10 +162,10 @@ bot.action(/^(CAT|BRAND)\|(.+)\|(\d+)$/, async (ctx) => {
 });
 bot.action('NOOP', (ctx)=>ctx.answerCbQuery());
 
-/* ───────── Cerca lliure (si no estem editant perfil) ───────── */
+/* ───────── Cerca lliure (no interrompre formularis) ───────── */
 bot.on('text', async (ctx, next) => {
   const s = getS(ctx.from.id);
-  if (['ASK_SIZE','ASK_NAME','ASK_ADDR'].includes(s.step)) return next();
+  if (['ASK_SIZE','ASK_SIZE_EDIT','ASK_NAME','ASK_ADDR'].includes(s.step)) return next();
 
   const q = ctx.message.text.trim();
   if (isCat(q) || isBrand(q) || isCart(q) || isAddr(q)) return;
@@ -190,7 +187,7 @@ async function showProductCard(ctx, p) {
   const caption = `🧩 ${p.name}\n💶 ${priceC?toEuro(priceC):'Preu a consultar'}\n\n${trim(p.description, 300)}`;
   const buttons = [
     [Markup.button.callback('➕ Afegir (tria talla)', `ASKSZ_${p.id}`)],
-    [Markup.button.callback('🧺 Veure cistella', 'CHECKOUT')]
+    [Markup.button.callback('🧺 Veure cistella', 'OPEN_CART')]
   ];
   try {
     if (p.image_url) await ctx.replyWithPhoto(p.image_url, { caption, ...Markup.inlineKeyboard(buttons) });
@@ -228,9 +225,11 @@ bot.action(/^SIZE\|(\d+)\|(.+)$/, async (ctx) => {
   const size = dec(ctx.match[2]);
   await addToCart(ctx, pid, size, 1);
 });
-bot.on('text', async (ctx) => {
+
+/* Text per TALLA (alta) — IMPORTANT: passa al següent handler si no toca */
+bot.on('text', async (ctx, next) => {
   const s = getS(ctx.from.id);
-  if (s.step !== 'ASK_SIZE') return;
+  if (s.step !== 'ASK_SIZE') return next();
   const size = ctx.message.text.trim().slice(0, 20);
   if (!size) return ctx.reply('Escriu una talla vàlida (ex: 42, 42.5, 43 1/3)');
   await addToCart(ctx, s.productId, size, 1);
@@ -247,22 +246,118 @@ async function addToCart(ctx, productId, size, qty=1) {
   const total = cart.reduce((a,it)=>a+(it.price_cents||0)*(it.qty||1),0);
   await ctx.reply(
     `🛒 Afegit: ${p.name} — talla ${size} ×${qty}\nTotal: ${toEuro(total)}`,
-    Markup.inlineKeyboard([[Markup.button.callback('🧺 Veure/Confirmar','CHECKOUT')],[Markup.button.callback('🛍️ Continuar comprant','NOOP')]])
+    Markup.inlineKeyboard([
+      [Markup.button.callback('🧺 Veure/Confirmar','OPEN_CART')],
+      [Markup.button.callback('🛍️ Continuar comprant','CONT_SHOP')]
+    ])
   );
 }
+
+bot.action('CONT_SHOP', async (ctx) => {
+  await ctx.answerCbQuery();
+  await ctx.reply('Perfecte! Escriu què busques o navega amb els botons.', Markup.keyboard([
+    ['📂 Categories','🏷️ Marques'],
+    ['🧺 Veure cistella','👤 Dades d’enviament']
+  ]).resize());
+});
+
+/* ───────── Cistella editable ───────── */
+function cartText(cart) {
+  const lines = cart.map((it,i)=>`#${i+1} ${it.productName} — talla ${it.size} ×${it.qty} = ${toEuro((it.price_cents||0)*(it.qty||1))}`);
+  const total = cart.reduce((a,it)=>a+(it.price_cents||0)*(it.qty||1),0);
+  return { text: ['Cistella:', ...lines, `Total: ${toEuro(total)}`].join('\n'), total };
+}
+function cartKeyboard(cart) {
+  const rows = [];
+  cart.slice(0,10).forEach((it, i) => {
+    rows.push([
+      Markup.button.callback(`−`, `DEC_${i}`),
+      Markup.button.callback(`×${it.qty}`, 'NOOP'),
+      Markup.button.callback(`+`, `INC_${i}`)
+    ]);
+    rows.push([
+      Markup.button.callback('🔁 Talla', `EDIT_SIZE_${i}`),
+      Markup.button.callback('🗑 Eliminar', `DEL_${i}`)
+    ]);
+  });
+  rows.push([Markup.button.callback('✅ Confirmar comanda','CHECKOUT')]);
+  rows.push([Markup.button.callback('🛍️ Continuar comprant','CONT_SHOP'), Markup.button.callback('🧹 Buidar','CLEAR_CART')]);
+  return Markup.inlineKeyboard(rows);
+}
+async function renderCart(ctx, edit=false) {
+  const s = getS(ctx.from.id);
+  if (!s.cart || !s.cart.length) {
+    if (edit) { try { await ctx.editMessageText('La cistella és buida.'); } catch { await ctx.reply('La cistella és buida.'); } }
+    else await ctx.reply('La cistella és buida.');
+    return;
+  }
+  const { text } = cartText(s.cart);
+  const kb = cartKeyboard(s.cart);
+  if (edit) { try { await ctx.editMessageText(text, kb); } catch { await ctx.reply(text, kb); } }
+  else await ctx.reply(text, kb);
+}
+async function showCart(ctx) { return renderCart(ctx, false); }
+
+bot.action('OPEN_CART', async (ctx) => { await ctx.answerCbQuery(); return renderCart(ctx, true); });
+bot.action(/INC_(\d+)/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const idx = Number(ctx.match[1]);
+  const s = getS(ctx.from.id); if (!s.cart?.[idx]) return;
+  s.cart[idx].qty = Math.min(99, (s.cart[idx].qty||1)+1);
+  setS(ctx.from.id, s);
+  return renderCart(ctx, true);
+});
+bot.action(/DEC_(\d+)/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const idx = Number(ctx.match[1]);
+  const s = getS(ctx.from.id); if (!s.cart?.[idx]) return;
+  s.cart[idx].qty = Math.max(0, (s.cart[idx].qty||1)-1);
+  if (s.cart[idx].qty === 0) s.cart.splice(idx,1);
+  setS(ctx.from.id, s);
+  return renderCart(ctx, true);
+});
+bot.action(/DEL_(\d+)/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const idx = Number(ctx.match[1]);
+  const s = getS(ctx.from.id); if (!s.cart?.[idx]) return;
+  s.cart.splice(idx,1);
+  setS(ctx.from.id, s);
+  return renderCart(ctx, true);
+});
+bot.action(/EDIT_SIZE_(\d+)/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const idx = Number(ctx.match[1]);
+  const s = getS(ctx.from.id); if (!s.cart?.[idx]) return;
+  setS(ctx.from.id, { ...s, step:'ASK_SIZE_EDIT', editIndex: idx });
+  return ctx.reply(`Escriu la *nova talla* per a «${s.cart[idx].productName}» (actual: ${s.cart[idx].size})`, { parse_mode:'Markdown' });
+});
+bot.on('text', async (ctx, next) => {
+  const s = getS(ctx.from.id);
+  if (s.step !== 'ASK_SIZE_EDIT') return next();
+  const val = ctx.message.text.trim().slice(0, 20);
+  if (!val) return ctx.reply('Talla no vàlida.');
+  if (!s.cart?.[s.editIndex]) { setS(ctx.from.id, { ...s, step:null, editIndex:null }); return ctx.reply('Element no trobat.'); }
+  s.cart[s.editIndex].size = val;
+  setS(ctx.from.id, { ...s, step:null, editIndex:null });
+  return renderCart(ctx, false);
+});
+
+bot.action('CLEAR_CART', async (ctx) => {
+  await ctx.answerCbQuery();
+  setS(ctx.from.id, { ...getS(ctx.from.id), cart: [] });
+  try { await ctx.editMessageText('🧹 Cistella buidada.'); } catch { await ctx.reply('🧹 Cistella buidada.'); }
+});
 
 /* ───────── Perfil (nom + adreça) ───────── */
 async function showOrEditProfile(ctx, fromMenu=false) {
   const cust = await db.getCustomer(ctx.from.id);
   if (cust?.customer_name && cust?.address_text) {
-    // mostrar i opcions
     const msg = `👤 *Dades d’enviament*\nNom: *${cust.customer_name}*\nAdreça:\n${cust.address_text}`;
     const kb = Markup.inlineKeyboard([
       [Markup.button.callback('✏️ Canviar nom', 'EDIT_NAME'), Markup.button.callback('✏️ Canviar adreça', 'EDIT_ADDR')]
     ]);
     return ctx.reply(msg, { parse_mode:'Markdown', ...kb });
   } else {
-    // demanar-les
     const s = getS(ctx.from.id);
     setS(ctx.from.id, { ...s, step:'ASK_NAME', profileMode:true });
     return ctx.reply('Escriu el teu **Nom i Cognoms**:', { parse_mode:'Markdown' });
@@ -271,26 +366,7 @@ async function showOrEditProfile(ctx, fromMenu=false) {
 bot.action('EDIT_NAME', async (ctx) => { await ctx.answerCbQuery(); const s=getS(ctx.from.id); setS(ctx.from.id,{...s,step:'ASK_NAME',profileMode:true}); ctx.reply('Escriu el teu **Nom i Cognoms**:',{parse_mode:'Markdown'}); });
 bot.action('EDIT_ADDR', async (ctx) => { await ctx.answerCbQuery(); const s=getS(ctx.from.id); setS(ctx.from.id,{...s,step:'ASK_ADDR',profileMode:true}); ctx.reply('Escriu la **adreça completa** d’enviament:',{parse_mode:'Markdown'}); });
 
-/* ───────── Cistella i Checkout ───────── */
-function cartText(cart) {
-  const lines = cart.map((it,i)=>`#${i+1} ${it.productName} — talla ${it.size} ×${it.qty} = ${toEuro((it.price_cents||0)*(it.qty||1))}`);
-  const total = cart.reduce((a,it)=>a+(it.price_cents||0)*(it.qty||1),0);
-  return { text: ['Cistella:', ...lines, `Total: ${toEuro(total)}`].join('\n'), total };
-}
-async function showCart(ctx) {
-  const s = getS(ctx.from.id);
-  if (!s.cart || !s.cart.length) return ctx.reply('La cistella és buida.');
-  const { text } = cartText(s.cart);
-  const cust = await db.getCustomer(ctx.from.id);
-  const footer = cust?.address_text ? `\n\n📍 Enviament a:\n${cust.address_text}` : '';
-  await ctx.reply(text + footer, Markup.inlineKeyboard([
-    [Markup.button.callback('✅ Confirmar comanda','CHECKOUT')],
-    [Markup.button.callback('👤 Dades d’enviament','OPEN_PROFILE')],
-    [Markup.button.callback('🧹 Buidar cistella','CLEAR_CART')]
-  ]));
-}
-bot.action('OPEN_PROFILE', async (ctx)=>{ await ctx.answerCbQuery(); return showOrEditProfile(ctx, true); });
-
+/* ───────── Checkout (amb perfil persistent) ───────── */
 bot.action('CHECKOUT', async (ctx) => {
   await ctx.answerCbQuery();
   const s = getS(ctx.from.id);
@@ -298,15 +374,13 @@ bot.action('CHECKOUT', async (ctx) => {
 
   const cust = await db.getCustomer(ctx.from.id);
   if (cust?.customer_name && cust?.address_text) {
-    // confirmar ús del perfil existent
     const msg = `Farem servir aquestes dades?\n\n👤 *${cust.customer_name}*\n📍 ${cust.address_text}`;
     const kb = Markup.inlineKeyboard([
       [Markup.button.callback('✅ Sí, confirmar', 'CONFIRM_PROFILE'), Markup.button.callback('✏️ Canviar', 'EDIT_PROFILE')]
     ]);
     return ctx.reply(msg, { parse_mode:'Markdown', ...kb });
   }
-
-  // No hi ha dades → demanar-les (mode checkout)
+  // No hi ha dades → demanar-les
   setS(ctx.from.id, { ...s, step:'ASK_NAME', profileMode:false });
   return ctx.reply('Escriu el teu **Nom i Cognoms**:', { parse_mode:'Markdown' });
 });
@@ -314,43 +388,40 @@ bot.action('EDIT_PROFILE', async (ctx)=>{ await ctx.answerCbQuery(); const s=get
 
 bot.action('CONFIRM_PROFILE', async (ctx) => {
   await ctx.answerCbQuery();
-  return finalizeOrder(ctx); // ja utilitzarà el perfil guardat
+  return finalizeOrder(ctx); // utilitza perfil guardat
 });
 
-/* Captura de Nom/Adreça (tant per perfil com per checkout) */
-bot.on('text', async (ctx) => {
+/* Formulari Nom/Adreça — IMPORTANT: aquests handlers han d'anar DESPRÉS dels altres on('text') */
+bot.on('text', async (ctx, next) => {
   const s = getS(ctx.from.id);
-  if (s.step === 'ASK_NAME') {
-    const name = ctx.message.text.trim().slice(0,120);
-    setS(ctx.from.id, { ...s, temp_name: name, step:'ASK_ADDR' });
-    return ctx.reply('Ara escriu la **adreça completa** d’enviament (carrer, número, porta, CP, ciutat, província):', { parse_mode:'Markdown' });
-  }
-  if (s.step === 'ASK_ADDR') {
-    const addr = ctx.message.text.trim().slice(0,400);
-    const name = s.temp_name || '';
-    // Desa perfil persistentment
-    await db.upsertCustomer(ctx.from.id, ctx.from.username || '', name, addr);
+  if (s.step !== 'ASK_NAME') return next();
+  const name = ctx.message.text.trim().slice(0,120);
+  setS(ctx.from.id, { ...s, temp_name: name, step:'ASK_ADDR' });
+  return ctx.reply('Ara escriu la **adreça completa** d’enviament (carrer, número, porta, CP, ciutat, província):', { parse_mode:'Markdown' });
+});
+bot.on('text', async (ctx, next) => {
+  const s = getS(ctx.from.id);
+  if (s.step !== 'ASK_ADDR') return next();
+  const addr = ctx.message.text.trim().slice(0,400);
+  const name = s.temp_name || '';
+  await db.upsertCustomer(ctx.from.id, ctx.from.username || '', name, addr);
 
-    if (s.profileMode) {
-      setS(ctx.from.id, { ...s, step:null, temp_name:null });
-      return ctx.reply('✅ Dades guardades. Ja les farem servir a les properes compres.');
-    } else {
-      setS(ctx.from.id, { ...s, step:null, temp_name:null });
-      return finalizeOrder(ctx); // estem en flux de checkout
-    }
+  if (s.profileMode) {
+    setS(ctx.from.id, { ...s, step:null, temp_name:null });
+    return ctx.reply('✅ Dades guardades. Ja les farem servir a les properes compres.');
+  } else {
+    setS(ctx.from.id, { ...s, step:null, temp_name:null });
+    return finalizeOrder(ctx);
   }
 });
 
-/* Finalització comanda utilitzant perfil persistent */
 async function finalizeOrder(ctx) {
   const s = getS(ctx.from.id);
   const cust = await db.getCustomer(ctx.from.id);
   if (!cust?.customer_name || !cust?.address_text) {
-    // seguretat extra: si falta, tornar a demanar
     setS(ctx.from.id, { ...s, step:'ASK_NAME', profileMode:false });
     return ctx.reply('Escriu el teu **Nom i Cognoms**:', { parse_mode:'Markdown' });
   }
-
   const { total } = cartText(s.cart || []);
   await db.insertOrder({
     user_id: ctx.from.id,
@@ -362,22 +433,12 @@ async function finalizeOrder(ctx) {
     address_text: cust.address_text,
     status: 'PENDING'
   });
-
   setS(ctx.from.id, { ...s, cart: [] });
-  // Confirmació al client
   try { await ctx.editMessageText(`✅ Comanda registrada! Import: ${toEuro(total)}. Et contactarem per pagament i enviament.`); }
   catch { await ctx.reply(`✅ Comanda registrada! Import: ${toEuro(total)}. Et contactarem per pagament i enviament.`); }
 }
 
-bot.action('CLEAR_CART', async (ctx) => {
-  await ctx.answerCbQuery();
-  setS(ctx.from.id, { ...getS(ctx.from.id), cart: [] });
-  try { await ctx.editMessageText('🧹 Cistella buidada.'); } catch { await ctx.reply('🧹 Cistella buidada.'); }
-});
-
-bot.catch((err, ctx) => { console.error('Customer bot error', err); try { ctx.reply('Hi ha hagut un error.'); } catch {} });
-
-/* Arrencada */
+/* ───────── Infra ───────── */
 const USE_WEBHOOK = String(process.env.USE_WEBHOOK).toLowerCase() === 'true';
 const PORT = Number(process.env.PORT || 3000);
 const APP_URL = process.env.APP_URL;

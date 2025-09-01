@@ -25,7 +25,7 @@ async function ensureSchema() {
   await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT now();`);
   await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS notified_at TIMESTAMPTZ;`);
 
-  // Taules auxiliars
+  // Taula de consultes (si no existia)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS queries(
       id BIGSERIAL PRIMARY KEY,
@@ -485,24 +485,42 @@ bot.on('text', async (ctx, next) => {
   }
 });
 
-/* Finalitzar comanda (recuperant cistella de BD si cal) */
+/* Finalitzar comanda — LLEGEIX SEMPRE LA CISTELLA DE BD PRIMER */
 async function finalizeOrder(ctx) {
-  let s = getS(ctx.from.id);
-  let cart = s.cart || [];
-  if (!cart.length) {
-    cart = await db.loadCart(ctx.from.id);
-    setS(ctx.from.id, { ...s, cart });
+  const userId = ctx.from.id;
+  const username = ctx.from.username || '';
+
+  // 1) Font de veritat: cistella guardada a BD
+  let persisted = [];
+  try {
+    persisted = await db.loadCart(userId);
+  } catch (e) {
+    console.error('loadCart error:', e.message);
   }
-  const cust = await db.getCustomer(ctx.from.id);
+
+  // 2) Si per algun motiu està buida, usem la de memòria
+  const s = getS(userId);
+  let cart = Array.isArray(persisted) && persisted.length ? persisted : (s.cart || []);
+  if (!cart.length) return ctx.reply('La cistella és buida.');
+
+  // 3) Dades del client
+  const cust = await db.getCustomer(userId);
   if (!cust?.customer_name || !cust?.address_text) {
-    setS(ctx.from.id, { ...s, step: 'ASK_NAME', profileMode: false });
+    setS(userId, { ...s, step: 'ASK_NAME', profileMode: false });
     return ctx.reply('Escriu el teu **Nom i Cognoms**:', { parse_mode: 'Markdown' });
   }
 
-  const { total } = cartText(cart);
+  // 4) Total robust
+  const total = cart.reduce((acc, it) => {
+    const price = Number(it.price_cents) || 0;
+    const qty = Number(it.qty) || 1;
+    return acc + price * qty;
+  }, 0);
+
+  // 5) Desa la comanda amb ITEMS reals
   await db.insertOrder({
-    user_id: ctx.from.id,
-    username: ctx.from.username || '',
+    user_id: userId,
+    username,
     items: cart,
     total_cents: total,
     total_cost_cents: 0,
@@ -511,12 +529,16 @@ async function finalizeOrder(ctx) {
     status: 'PENDING'
   });
 
-  // Neteja cistella (memòria + BD)
-  setS(ctx.from.id, { ...s, cart: [] });
-  await persistCart(ctx, []);
+  // 6) Neteja cistella (memòria + BD)
+  setS(userId, { ...s, cart: [] });
+  try { await db.saveCart(userId, username, []); } catch (e) { console.error('saveCart after order error:', e.message); }
 
-  try { await ctx.editMessageText(`✅ Comanda registrada! Import: ${toEuro(total)}. Et contactarem per pagament i enviament.`); }
-  catch { await ctx.reply(`✅ Comanda registrada! Import: ${toEuro(total)}. Et contactarem per pagament i enviament.`); }
+  // 7) Confirmació al client
+  try {
+    await ctx.editMessageText(`✅ Comanda registrada! Import: ${toEuro(total)}. Et contactarem per pagament i enviament.`);
+  } catch {
+    await ctx.reply(`✅ Comanda registrada! Import: ${toEuro(total)}. Et contactarem per pagament i enviament.`);
+  }
 }
 
 /* ───────── Infra ───────── */

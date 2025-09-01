@@ -1,10 +1,10 @@
-// customer_bot.js — Categories/Marques amb o sense emoji + flux compra + cap menció d'admin
+// customer_bot.js — Catàleg per categories/marques + targeta producte (foto/preu) + talla demanada al client
 import 'dotenv/config';
 import { Telegraf, Markup } from 'telegraf';
 import pkg from 'pg';
 const { Pool } = pkg;
 
-/* DB */
+/* ───────── DB ───────── */
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.PGSSLMODE === 'require' ? { rejectUnauthorized: false } : false
@@ -13,6 +13,9 @@ const pool = new Pool({
 async function ensureSchema() {
   await pool.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS brand TEXT;`);
   await pool.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS category TEXT;`);
+  await pool.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS image_url TEXT;`);
+  await pool.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS base_price_cents INT;`);
+  await pool.query(`ALTER TABLE orders   ADD COLUMN IF NOT EXISTS total_cost_cents INT DEFAULT 0;`);
 }
 await ensureSchema();
 
@@ -21,16 +24,6 @@ const db = {
     (await pool.query('SELECT * FROM products WHERE name ILIKE $1 ORDER BY id DESC LIMIT 25',[q])).rows,
   getProduct: async (id) =>
     (await pool.query('SELECT * FROM products WHERE id=$1',[id])).rows[0],
-  getVariantsOfProduct: async (pid) =>
-    (await pool.query('SELECT * FROM variants WHERE product_id=$1 ORDER BY id ASC',[pid])).rows,
-  getVariant: async (id) =>
-    (await pool.query('SELECT * FROM variants WHERE id=$1',[id])).rows[0],
-  decStock: async (variant_id, qty) =>
-    pool.query('UPDATE variants SET stock = stock - $1 WHERE id=$2 AND stock >= $1',[qty,variant_id]),
-  insertOrder: async (user_id, username, items_json, total_cents, total_cost_cents) =>
-    pool.query('INSERT INTO orders(user_id, username, items_json, total_cents, total_cost_cents) VALUES($1,$2,$3,$4,$5)',[user_id,username,items_json,total_cents,total_cost_cents]),
-  insertQuery: async (user_id, username, text) =>
-    pool.query('INSERT INTO queries(user_id, username, text) VALUES($1,$2,$3)',[user_id,username,text]),
   topCategories: async () =>
     (await pool.query(`SELECT category, COUNT(*) n FROM products WHERE COALESCE(category,'')<>'' GROUP BY 1 ORDER BY n DESC LIMIT 12`)).rows,
   topBrands: async () =>
@@ -43,25 +36,34 @@ const db = {
     Number((await pool.query(`SELECT COUNT(*) FROM products WHERE brand ILIKE $1`,[b])).rows[0].count),
   pageByBrand: async (b, limit, offset) =>
     (await pool.query(`SELECT * FROM products WHERE brand ILIKE $1 ORDER BY id DESC LIMIT $2 OFFSET $3`,[b,limit,offset])).rows,
+  insertOrder: async (user_id, username, items, total_cents, total_cost_cents=0) =>
+    pool.query('INSERT INTO orders(user_id, username, items_json, total_cents, total_cost_cents) VALUES($1,$2,$3,$4,$5)',
+      [user_id, username, JSON.stringify(items), total_cents, total_cost_cents]),
+  insertQuery: async (user_id, username, text) =>
+    pool.query('INSERT INTO queries(user_id, username, text) VALUES($1,$2,$3)',[user_id,username,text]),
 };
 
+/* ───────── Bot ───────── */
 const BOT_TOKEN = process.env.CUSTOMER_BOT_TOKEN || process.env.CLIENT_BOT_TOKEN;
 if (!BOT_TOKEN) throw new Error('Falta CUSTOMER_BOT_TOKEN o CLIENT_BOT_TOKEN');
+const ADMIN_CHAT_IDS = (process.env.ADMIN_CHAT_IDS || '').split(',').map(s=>s.trim()).filter(Boolean);
 
 const bot = new Telegraf(BOT_TOKEN);
 const sessions = new Map();
 const getS = (id) => sessions.get(id) || {};
 const setS = (id, s) => sessions.set(id, s);
-const toEuro = (c) => (c/100).toLocaleString('es-ES',{style:'currency',currency:'EUR'});
+
+const toEuro = (c) => (Number(c||0)/100).toLocaleString('es-ES',{style:'currency',currency:'EUR'});
 const PAGE = 10;
 const enc = (s) => encodeURIComponent(s || '');
 const dec = (s) => decodeURIComponent(s || '');
+const trim = (t, n=300) => (t||'').replace(/\s+/g,' ').trim().slice(0,n);
 
-/* ===== Menú ===== */
+/* ───────── UI bàsica ───────── */
 bot.start((ctx) => {
   setS(ctx.from.id, {});
   ctx.reply(
-    '👋 Benvingut/da! Pots cercar escrivint (ex: "samba") o navegar pel catàleg:',
+    '👋 Benvingut/da! Escriu per cercar (ex: "samba") o navega:',
     Markup.keyboard([['📂 Categories','🏷️ Marques'],['🧺 Veure cistella']]).resize()
   );
 });
@@ -69,11 +71,10 @@ bot.command('categories', (ctx)=> bot.emit('hears','📂 Categories',ctx));
 bot.command('marques',    (ctx)=> bot.emit('hears','🏷️ Marques',ctx));
 bot.command('cistella',   (ctx)=> bot.emit('hears','🧺 Veure cistella',ctx));
 
-/* Accepta amb i sense emoji (i indiferent a majúscules) */
-const mktest = (t) => (s) => new RegExp(`^(${t}|.*${t.replace(/\s+/g,'.*')}).*$`,'i').test(s);
-const isCat    = mktest('categories');
-const isBrand  = mktest('marques');
-const isCart   = mktest('veure\\s+cistella');
+/* Accepta sense emoji / majúscules */
+const isCat   = (s) => /^(\p{Emoji_Presentation}?\s*)?categories$/iu.test(s.trim());
+const isBrand = (s) => /^(\p{Emoji_Presentation}?\s*)?marques$/iu.test(s.trim());
+const isCart  = (s) => /^(\p{Emoji_Presentation}?\s*)?veure\s+cistella$/iu.test(s.trim());
 
 bot.hears([/📂\s*Categories/i, isCat], async (ctx) => {
   const cats = await db.topCategories();
@@ -89,19 +90,9 @@ bot.hears([/🏷️\s*Marques/i, isBrand], async (ctx) => {
   await ctx.reply('Tria una marca:', Markup.inlineKeyboard(rows));
 });
 
-bot.hears([/🧺\s*Veure\s*Cistella/i, isCart], (ctx) => {
-  const s = getS(ctx.from.id);
-  if (!s.cart || !s.cart.length) return ctx.reply('La cistella és buida.');
-  const lines = s.cart.map((it,i)=>`#${i+1} ${it.productName} — ${it.variantLabel} ×${it.qty} = ${toEuro(it.price_cents*it.qty)}`);
-  const total = s.cart.reduce((a,it)=>a+it.price_cents*it.qty,0);
-  ctx.reply(['Cistella:',...lines,`Total: ${toEuro(total)}`].join('\n'),
-    Markup.inlineKeyboard([
-      [Markup.button.callback('✅ Confirmar comanda','CHECKOUT')],
-      [Markup.button.callback('🧹 Buidar cistella','CLEAR_CART')]
-    ]));
-});
+bot.hears([/🧺\s*Veure\s*Cistella/i, isCart], (ctx) => showCart(ctx));
 
-/* ===== Paginació llistes ===== */
+/* ───────── Llistats amb paginació ───────── */
 async function renderList(ctx, mode, value, page) {
   const offset = page*PAGE;
   let total=0, rows=[];
@@ -117,23 +108,22 @@ async function renderList(ctx, mode, value, page) {
   if (page<pages-1) nav.push(Markup.button.callback('▶️ Seg', `${mode}|${enc(value)}|${page+1}`));
   items.push(nav);
   const title = mode==='CAT' ? `Categoria: ${value}` : `Marca: ${value}`;
-
   try { await ctx.editMessageText(`${title}\nTria un producte:`, Markup.inlineKeyboard(items)); }
   catch { await ctx.reply(`${title}\nTria un producte:`, Markup.inlineKeyboard(items)); }
 }
 bot.action(/^(CAT|BRAND)\|(.+)\|(\d+)$/, async (ctx) => {
-  const mode = ctx.match[1]; const value = decodeURIComponent(ctx.match[2]); const page = Number(ctx.match[3]);
+  const mode = ctx.match[1]; const value = dec(ctx.match[2]); const page = Number(ctx.match[3]);
   await ctx.answerCbQuery(); return renderList(ctx, mode, value, page);
 });
 bot.action('NOOP', (ctx)=>ctx.answerCbQuery());
 
-/* ===== Cerca lliure (si no estem demanant quantitat) ===== */
+/* ───────── Cerca lliure (si no demanem talla/quantitat) ───────── */
 bot.on('text', async (ctx, next) => {
   const s = getS(ctx.from.id);
-  if (s.step === 'ASK_QTY') return next();
+  if (s.step === 'ASK_SIZE' || s.step === 'ASK_QTY') return next();
 
   const q = ctx.message.text.trim();
-  if (isCat(q) || isBrand(q) || isCart(q)) return; // ja cobert pels hears
+  if (isCat(q) || isBrand(q) || isCart(q)) return;
   await db.insertQuery(ctx.from.id, ctx.from.username||'', q);
 
   const rows = await db.listProductsLike(`%${q}%`);
@@ -142,75 +132,144 @@ bot.on('text', async (ctx, next) => {
   await ctx.reply('He trobat això. Tria un producte:', Markup.inlineKeyboard(kb));
 });
 
-/* ===== Producte → Variants → Quantitat ===== */
+/* ───────── Targeta producte + demanar talla ───────── */
+function priceText(p) {
+  return p.base_price_cents ? toEuro(p.base_price_cents) : 'Preu a consultar';
+}
+function sizeSuggestionsFor(p) {
+  if ((p.category||'').toLowerCase().includes('roba')) {
+    return ['XS','S','M','L','XL','XXL'];
+  }
+  // calçat per defecte
+  return ['36','36.5','37','37.5','38','38.5','39','40','40.5','41','42','42.5','43','44','44.5','45','46'];
+}
+
+async function showProductCard(ctx, p) {
+  const caption = `🧩 ${p.name}\n💶 ${priceText(p)}\n\n${trim(p.description, 300)}`;
+  const buttons = [
+    [Markup.button.callback('➕ Afegir (tria talla)', `ASKSZ_${p.id}`)],
+    [Markup.button.callback('🧺 Veure cistella', 'CHECKOUT')]
+  ];
+  try {
+    if (p.image_url) {
+      await ctx.replyWithPhoto(p.image_url, { caption, ...Markup.inlineKeyboard(buttons) });
+    } else {
+      await ctx.reply(caption, Markup.inlineKeyboard(buttons));
+    }
+  } catch {
+    await ctx.reply(caption, Markup.inlineKeyboard(buttons));
+  }
+}
+
 bot.action(/P_(\d+)/, async (ctx) => {
   await ctx.answerCbQuery();
-  const productId = Number(ctx.match[1]);
-  const p = await db.getProduct(productId);
+  const pid = Number(ctx.match[1]);
+  const p = await db.getProduct(pid);
   if (!p) return ctx.answerCbQuery('Producte no trobat');
-
-  const vs = await db.getVariantsOfProduct(productId);
-  if (!vs.length) return ctx.reply(`«${p.name}» no té variants disponibles ara mateix.`);
-  const kb = vs.map(v => [Markup.button.callback(`${v.option_value} — ${toEuro(v.price_cents)} (${v.stock} stock)`, `V_${v.id}`)]);
-  try { await ctx.editMessageText(`Opcions per a «${p.name}»:`, Markup.inlineKeyboard(kb)); }
-  catch { await ctx.reply(`Opcions per a «${p.name}»:`, Markup.inlineKeyboard(kb)); }
+  return showProductCard(ctx, p);
 });
 
-bot.action(/V_(\d+)/, async (ctx) => {
+// Inicia el flux per demanar talla (amb suggeriments + text lliure)
+bot.action(/ASKSZ_(\d+)/, async (ctx) => {
   await ctx.answerCbQuery();
-  const variantId = Number(ctx.match[1]);
-  const v = await db.getVariant(variantId);
-  if (!v) return ctx.answerCbQuery('Variant no disponible');
-  const p = await db.getProduct(v.product_id);
+  const pid = Number(ctx.match[1]);
+  const p = await db.getProduct(pid);
+  if (!p) return;
   const s = getS(ctx.from.id);
-  setS(ctx.from.id, { ...s, step:'ASK_QTY', productId: p.id, variantId: v.id });
-  await ctx.reply(`Quantes unitats vols de «${p.name} — ${v.option_value}»? Escriu un número (stock: ${v.stock}).`);
+  setS(ctx.from.id, { ...s, step:'ASK_SIZE', productId: pid });
+
+  const sizes = sizeSuggestionsFor(p);
+  const rows = [];
+  for (let i=0; i<sizes.length; i+=3) rows.push(sizes.slice(i,i+3).map(v => Markup.button.callback(v, `SIZE|${pid}|${enc(v)}`)));
+  rows.push([Markup.button.callback('✍️ Escriure talla manualment', 'NOOP')]);
+
+  const txt = `D'acord! Indica la **talla** per a «${p.name}».\n\nTria una opció o escriu-la (ex: 42.5, 43 1/3, 28cm).`;
+  try { await ctx.editMessageText(txt, { parse_mode:'Markdown', ...Markup.inlineKeyboard(rows) }); }
+  catch { await ctx.reply(txt, { parse_mode:'Markdown', ...Markup.inlineKeyboard(rows) }); }
 });
 
-/* ===== Demanar quantitat ===== */
+// Talla escollida via botó
+bot.action(/^SIZE\|(\d+)\|(.+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const pid = Number(ctx.match[1]);
+  const size = dec(ctx.match[2]);
+  await addToCart(ctx, pid, size, 1);
+});
+
+// Talla escrita pel client
 bot.on('text', async (ctx) => {
   const s = getS(ctx.from.id);
-  if (s.step !== 'ASK_QTY') return;
-  const qty = Number(ctx.message.text.replace(/[^0-9]/g,''));
-  if (!qty || qty < 1) return ctx.reply('Posa un número vàlid (1, 2, 3, …)');
+  if (s.step !== 'ASK_SIZE') return; // altres textos gestionats abans
+  const size = ctx.message.text.trim().slice(0, 20);
+  if (!size) return ctx.reply('Escriu una talla vàlida (ex: 42, 42.5, 43 1/3)');
+  await addToCart(ctx, s.productId, size, 1);
+});
 
-  const v = await db.getVariant(s.variantId);
-  const p = await db.getProduct(s.productId);
-  if (!v || !p) return ctx.reply('Ha expirat la selecció. Torna-ho a provar.');
-  if (qty > v.stock) return ctx.reply(`Només queden ${v.stock} unitats en stock.`);
+async function addToCart(ctx, productId, size, qty=1) {
+  const p = await db.getProduct(productId);
+  if (!p) return ctx.reply('No he pogut trobar el producte. Torna-ho a provar.');
 
-  const item = { productId: p.id, productName: p.name, variantId: v.id, variantLabel: v.option_value, price_cents: v.price_cents, cost_cents: v.cost_cents||0, qty };
+  const item = {
+    productId: p.id,
+    productName: p.name,
+    size,
+    price_cents: p.base_price_cents || 0,
+    qty
+  };
+
+  const s = getS(ctx.from.id);
   const cart = (s.cart || []).concat(item);
   setS(ctx.from.id, { step:null, cart });
-  const total = cart.reduce((a,it)=>a+it.price_cents*it.qty,0);
 
+  const total = cart.reduce((a,it)=>a+(it.price_cents||0)*(it.qty||1),0);
   await ctx.reply(
-    `Afegit a la cistella: ${p.name} — ${v.option_value} ×${qty}.\nTotal actual: ${toEuro(total)}`,
+    `🛒 Afegit: ${p.name} — talla ${size} ×${qty}\nTotal: ${toEuro(total)}`,
     Markup.inlineKeyboard([
       [Markup.button.callback('🧺 Veure/Confirmar', 'CHECKOUT')],
       [Markup.button.callback('🛍️ Continuar comprant', 'NOOP')]
     ])
   );
-});
+}
 
-/* ===== Checkout / Cistella ===== */
+/* ───────── Cistella / Checkout ───────── */
+function cartText(cart) {
+  const lines = cart.map((it,i)=>`#${i+1} ${it.productName} — talla ${it.size} ×${it.qty} = ${toEuro((it.price_cents||0)*(it.qty||1))}`);
+  const total = cart.reduce((a,it)=>a+(it.price_cents||0)*(it.qty||1),0);
+  return { text: ['Cistella:', ...lines, `Total: ${toEuro(total)}`].join('\n'), total };
+}
+
+async function showCart(ctx) {
+  const s = getS(ctx.from.id);
+  if (!s.cart || !s.cart.length) return ctx.reply('La cistella és buida.');
+  const { text } = cartText(s.cart);
+  await ctx.reply(text,
+    Markup.inlineKeyboard([
+      [Markup.button.callback('✅ Confirmar comanda','CHECKOUT')],
+      [Markup.button.callback('🧹 Buidar cistella','CLEAR_CART')]
+    ]));
+}
+
 bot.action('CHECKOUT', async (ctx) => {
   await ctx.answerCbQuery();
   const s = getS(ctx.from.id);
-  if (!s.cart || !s.cart.length) return ctx.reply('Cistella buida.');
+  if (!s.cart || !s.cart.length) return ctx.reply('La cistella és buida.');
 
-  for (const it of s.cart) {
-    const res = await db.decStock(it.variantId, it.qty);
-    if (res.rowCount === 0) return ctx.reply(`Sense stock suficient per ${it.productName} — ${it.variantLabel}.`);
-  }
-
-  const total = s.cart.reduce((a,it)=>a+it.price_cents*it.qty,0);
-  const totalCost = s.cart.reduce((a,it)=>a+(it.cost_cents||0)*it.qty,0);
-  await db.insertOrder(ctx.from.id, ctx.from.username||'', s.cart, total, totalCost);
+  const { total } = cartText(s.cart);
+  await db.insertOrder(ctx.from.id, ctx.from.username||'', s.cart, total, 0);
   setS(ctx.from.id, { cart: [] });
 
-  try { await ctx.editMessageText(`✅ Comanda registrada! Total: ${toEuro(total)}. Ens posarem en contacte.`); }
-  catch { await ctx.reply(`✅ Comanda registrada! Total: ${toEuro(total)}. Ens posarem en contacte.`); }
+  // Confirmació al client (sense cap menció d'admin)
+  try { await ctx.editMessageText(`✅ Comanda registrada! Import: ${toEuro(total)}. Ens posarem en contacte per tancar el pagament i l’enviament.`); }
+  catch { await ctx.reply(`✅ Comanda registrada! Import: ${toEuro(total)}. Ens posarem en contacte per tancar el pagament i l’enviament.`); }
+
+  // (Opcional) notificació interna als admins
+  if (ADMIN_CHAT_IDS.length) {
+    const orderPreview = s.cart.map(it => `• ${it.productName} — talla ${it.size} ×${it.qty} (${toEuro((it.price_cents||0)*(it.qty||1))})`).join('\n');
+    const msg = `📦 Nova comanda de @${ctx.from.username || ctx.from.id}\n${orderPreview}\nTotal: ${toEuro(total)}`;
+    for (const chatId of ADMIN_CHAT_IDS) {
+      try { await bot.telegram.sendMessage(chatId, msg); } catch {}
+    }
+  }
 });
 
 bot.action('CLEAR_CART', async (ctx) => {
@@ -220,9 +279,9 @@ bot.action('CLEAR_CART', async (ctx) => {
   catch { await ctx.reply('🧹 Cistella buidada.'); }
 });
 
-bot.catch((err, ctx) => { console.error('Customer bot error', err); try { ctx.reply('Sembla que hi ha hagut un error.'); } catch {} });
+bot.catch((err, ctx) => { console.error('Customer bot error', err); try { ctx.reply('Hi ha hagut un error.'); } catch {} });
 
-/* ARRANQUE */
+/* ───────── Arrencada ───────── */
 const USE_WEBHOOK = String(process.env.USE_WEBHOOK).toLowerCase() === 'true';
 const PORT = Number(process.env.PORT || 3000);
 const APP_URL = process.env.APP_URL;
@@ -241,5 +300,6 @@ if (USE_WEBHOOK) {
   console.log('Bot running (long polling)');
 }
 
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
+// Evitar soroll "Bot is not running!" als logs en aturada
+process.once('SIGINT',  () => { try { bot.stop('SIGINT');  } catch {} });
+process.once('SIGTERM', () => { try { bot.stop('SIGTERM'); } catch {} });

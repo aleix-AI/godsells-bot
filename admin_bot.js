@@ -121,3 +121,57 @@ async function notifyNewOrders() {
         `💶 Total: ${toEuro(o.total_cents)}`,
         `🕒 ${new Date(o.created_at).toLocaleString('es-ES')}`
       ].join('\n');
+
+      for (const aid of ADMIN_IDS) {
+        try {
+          await admin.telegram.sendMessage(aid, msg); // text pla, sense parse_mode
+        } catch (e) {
+          console.error(`Send fail to ${aid}`, e.message);
+        }
+      }
+
+      await pool.query(`UPDATE orders SET notified_at = now() WHERE id=$1`, [o.id]);
+    }
+  } catch (e) {
+    console.error('notifyNewOrders error', e.message);
+  }
+}
+
+admin.command('forcecheck', async (ctx) => {
+  if (!isAdmin(ctx)) return;
+  await notifyNewOrders();
+  ctx.reply('🔔 Check forçat fet.');
+});
+
+setInterval(() => {
+  notifyNewOrders().catch((e) => console.error('notify error', e.message));
+}, WATCH_MS);
+
+/* ───────── Arrencada ───────── */
+const USE_WEBHOOK = String(process.env.USE_WEBHOOK).toLowerCase() === 'true';
+const PORT = Number(process.env.PORT || 3000);
+const APP_URL = process.env.APP_URL;
+const HOOK_PATH = process.env.HOOK_PATH || '/tghook';
+
+if (USE_WEBHOOK) {
+  const express = (await import('express')).default;
+  const app = express();
+  app.use(admin.webhookCallback(HOOK_PATH));
+  if (!APP_URL) throw new Error('Falta APP_URL per al webhook');
+  await admin.telegram.setWebhook(`${APP_URL}${HOOK_PATH}`);
+  app.get('/', (_, res) => res.send('OK'));
+  app.listen(PORT, () => console.log('Admin listening on', PORT));
+} else {
+  await admin.launch();
+  console.log('Admin bot running (long polling)');
+}
+
+process.once('SIGINT', () => {
+  try { admin.stop('SIGINT'); } catch {}
+});
+process.once('SIGTERM', () => {
+  try { admin.stop('SIGTERM'); } catch {}
+});
+
+      ].join('\n');
+

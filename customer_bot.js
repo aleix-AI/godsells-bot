@@ -1,4 +1,4 @@
-// customer_bot.js — Cistella persistent a BD, cistella editable, perfil persistent, flux net
+// customer_bot.js — Cistella persistent a BD, cistella editable, perfil persistent, flux net + notificació a admins
 import 'dotenv/config';
 import { Telegraf, Markup } from 'telegraf';
 import pkg from 'pg';
@@ -25,7 +25,7 @@ async function ensureSchema() {
   await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT now();`);
   await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS notified_at TIMESTAMPTZ;`);
 
-  // Taula de consultes (si no existia)
+  // Taula de consultes
   await pool.query(`
     CREATE TABLE IF NOT EXISTS queries(
       id BIGSERIAL PRIMARY KEY,
@@ -91,11 +91,12 @@ const db = {
     Number((await pool.query(`SELECT MIN(price_cents) AS min FROM variants WHERE product_id=$1`, [pid])).rows[0]?.min || 0),
 
   insertOrder: async (o) =>
-    pool.query(
+    (await pool.query(
       `INSERT INTO orders(user_id, username, items_json, total_cents, total_cost_cents, customer_name, address_text, status)
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8)`,
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+       RETURNING id, created_at`,
       [o.user_id, o.username, JSON.stringify(o.items), o.total_cents, o.total_cost_cents || 0, o.customer_name || '', o.address_text || '', o.status || 'PENDING']
-    ),
+    )).rows[0],
 
   insertQuery: async (user_id, username, text) =>
     pool.query('INSERT INTO queries(user_id, username, text) VALUES($1,$2,$3)', [user_id, username, text]),
@@ -133,6 +134,9 @@ const db = {
 /* ───────── Bot ───────── */
 const BOT_TOKEN = process.env.CUSTOMER_BOT_TOKEN || process.env.CLIENT_BOT_TOKEN;
 if (!BOT_TOKEN) throw new Error('Falta CUSTOMER_BOT_TOKEN o CLIENT_BOT_TOKEN');
+
+// on avisos a admins des d'aquest bot (ids separats per comes)
+const ADMIN_CHAT_IDS = (process.env.ADMIN_CHAT_IDS || process.env.ADMIN_USER_ID || '').split(',').map(s => s.trim()).filter(Boolean);
 
 const bot = new Telegraf(BOT_TOKEN);
 const sessions = new Map();           // key: userId -> { step, cart, ... }
@@ -268,9 +272,9 @@ bot.action(/ASKSZ_(\d+)/, async (ctx) => {
   for (let i = 0; i < sizes.length; i += 3) rows.push(sizes.slice(i, i + 3).map(v => Markup.button.callback(v, `SIZE|${pid}|${enc(v)}`)));
   rows.push([Markup.button.callback('✍️ Escriure talla manualment', 'NOOP')]);
 
-  const txt = `Indica la **talla** per a «${p.name}».\nTria una opció o escriu-la (ex: 42.5, 43 1/3).`;
-  try { await ctx.editMessageText(txt, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(rows) }); }
-  catch { await ctx.reply(txt, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(rows) }); }
+  const txt = `Indica la talla per a «${p.name}». Tria una opció o escriu-la (ex: 42.5, 43 1/3).`;
+  try { await ctx.editMessageText(txt, Markup.inlineKeyboard(rows)); }
+  catch { await ctx.reply(txt, Markup.inlineKeyboard(rows)); }
 });
 bot.action(/^SIZE\|(\d+)\|(.+)$/, async (ctx) => {
   await ctx.answerCbQuery();
@@ -399,7 +403,7 @@ bot.action(/EDIT_SIZE_(\d+)/, async (ctx) => {
   const idx = Number(ctx.match[1]);
   const s = getS(ctx.from.id); if (!s.cart?.[idx]) return;
   setS(ctx.from.id, { ...s, step: 'ASK_SIZE_EDIT', editIndex: idx });
-  return ctx.reply(`Escriu la *nova talla* per a «${s.cart[idx].productName}» (actual: ${s.cart[idx].size})`, { parse_mode: 'Markdown' });
+  return ctx.reply(`Escriu la nova talla per a «${s.cart[idx].productName}» (actual: ${s.cart[idx].size})`);
 });
 bot.on('text', async (ctx, next) => {
   const s = getS(ctx.from.id);
@@ -421,22 +425,22 @@ bot.action('CLEAR_CART', async (ctx) => {
 });
 
 /* ───────── Perfil (nom + adreça) ───────── */
-async function showOrEditProfile(ctx, fromMenu = false) {
+async function showOrEditProfile(ctx, _fromMenu = false) {
   const cust = await db.getCustomer(ctx.from.id);
   if (cust?.customer_name && cust?.address_text) {
-    const msg = `👤 *Dades d’enviament*\nNom: *${cust.customer_name}*\nAdreça:\n${cust.address_text}`;
+    const msg = `👤 Dades d’enviament\nNom: ${cust.customer_name}\nAdreça:\n${cust.address_text}`;
     const kb = Markup.inlineKeyboard([
       [Markup.button.callback('✏️ Canviar nom', 'EDIT_NAME'), Markup.button.callback('✏️ Canviar adreça', 'EDIT_ADDR')]
     ]);
-    return ctx.reply(msg, { parse_mode: 'Markdown', ...kb });
+    return ctx.reply(msg, kb);
   } else {
     const s = getS(ctx.from.id);
     setS(ctx.from.id, { ...s, step: 'ASK_NAME', profileMode: true });
-    return ctx.reply('Escriu el teu **Nom i Cognoms**:', { parse_mode: 'Markdown' });
+    return ctx.reply('Escriu el teu Nom i Cognoms:');
   }
 }
-bot.action('EDIT_NAME', async (ctx) => { await ctx.answerCbQuery(); const s = getS(ctx.from.id); setS(ctx.from.id, { ...s, step: 'ASK_NAME', profileMode: true }); ctx.reply('Escriu el teu **Nom i Cognoms**:', { parse_mode: 'Markdown' }); });
-bot.action('EDIT_ADDR', async (ctx) => { await ctx.answerCbQuery(); const s = getS(ctx.from.id); setS(ctx.from.id, { ...s, step: 'ASK_ADDR', profileMode: true }); ctx.reply('Escriu la **adreça completa** d’enviament:', { parse_mode: 'Markdown' }); });
+bot.action('EDIT_NAME', async (ctx) => { await ctx.answerCbQuery(); const s = getS(ctx.from.id); setS(ctx.from.id, { ...s, step: 'ASK_NAME', profileMode: true }); ctx.reply('Escriu el teu Nom i Cognoms:'); });
+bot.action('EDIT_ADDR', async (ctx) => { await ctx.answerCbQuery(); const s = getS(ctx.from.id); setS(ctx.from.id, { ...s, step: 'ASK_ADDR', profileMode: true }); ctx.reply('Escriu l’adreça completa d’enviament:'); });
 
 /* ───────── Checkout ───────── */
 bot.action('CHECKOUT', async (ctx) => {
@@ -450,16 +454,16 @@ bot.action('CHECKOUT', async (ctx) => {
 
   const cust = await db.getCustomer(ctx.from.id);
   if (cust?.customer_name && cust?.address_text) {
-    const msg = `Farem servir aquestes dades?\n\n👤 *${cust.customer_name}*\n📍 ${cust.address_text}`;
+    const msg = `Farem servir aquestes dades?\n\n${cust.customer_name}\n${cust.address_text}`;
     const kb = Markup.inlineKeyboard([
       [Markup.button.callback('✅ Sí, confirmar', 'CONFIRM_PROFILE'), Markup.button.callback('✏️ Canviar', 'EDIT_PROFILE')]
     ]);
-    return ctx.reply(msg, { parse_mode: 'Markdown', ...kb });
+    return ctx.reply(msg, kb);
   }
   setS(ctx.from.id, { ...getS(ctx.from.id), step: 'ASK_NAME', profileMode: false });
-  return ctx.reply('Escriu el teu **Nom i Cognoms**:', { parse_mode: 'Markdown' });
+  return ctx.reply('Escriu el teu Nom i Cognoms:');
 });
-bot.action('EDIT_PROFILE', async (ctx) => { await ctx.answerCbQuery(); const s = getS(ctx.from.id); setS(ctx.from.id, { ...s, step: 'ASK_NAME', profileMode: false }); ctx.reply('Escriu el teu **Nom i Cognoms**:', { parse_mode: 'Markdown' }); });
+bot.action('EDIT_PROFILE', async (ctx) => { await ctx.answerCbQuery(); const s = getS(ctx.from.id); setS(ctx.from.id, { ...s, step: 'ASK_NAME', profileMode: false }); ctx.reply('Escriu el teu Nom i Cognoms:'); });
 bot.action('CONFIRM_PROFILE', async (ctx) => { await ctx.answerCbQuery(); return finalizeOrder(ctx); });
 
 /* Formulari Nom/Adreça (handlers al final) */
@@ -468,7 +472,7 @@ bot.on('text', async (ctx, next) => {
   if (s.step !== 'ASK_NAME') return next();
   const name = ctx.message.text.trim().slice(0, 120);
   setS(ctx.from.id, { ...s, temp_name: name, step: 'ASK_ADDR' });
-  return ctx.reply('Ara escriu la **adreça completa** d’enviament (carrer, número, porta, CP, ciutat, província):', { parse_mode: 'Markdown' });
+  return ctx.reply('Ara escriu l’adreça completa d’enviament (carrer, número, porta, CP, ciutat):');
 });
 bot.on('text', async (ctx, next) => {
   const s = getS(ctx.from.id);
@@ -478,25 +482,21 @@ bot.on('text', async (ctx, next) => {
   await db.upsertCustomer(ctx.from.id, ctx.from.username || '', name, addr);
   if (s.profileMode) {
     setS(ctx.from.id, { ...s, step: null, temp_name: null });
-    return ctx.reply('✅ Dades guardades. Ja les farem servir a les properes compres.');
+    return ctx.reply('✅ Dades guardades.');
   } else {
     setS(ctx.from.id, { ...s, step: null, temp_name: null });
     return finalizeOrder(ctx);
   }
 });
 
-/* Finalitzar comanda — LLEGEIX SEMPRE LA CISTELLA DE BD PRIMER */
+/* Finalitzar comanda — LLEGEIX SEMPRE LA CISTELLA DE BD PRIMER i envia avís a admins */
 async function finalizeOrder(ctx) {
   const userId = ctx.from.id;
   const username = ctx.from.username || '';
 
   // 1) Font de veritat: cistella guardada a BD
   let persisted = [];
-  try {
-    persisted = await db.loadCart(userId);
-  } catch (e) {
-    console.error('loadCart error:', e.message);
-  }
+  try { persisted = await db.loadCart(userId); } catch (e) { console.error('loadCart error:', e.message); }
 
   // 2) Si per algun motiu està buida, usem la de memòria
   const s = getS(userId);
@@ -507,18 +507,14 @@ async function finalizeOrder(ctx) {
   const cust = await db.getCustomer(userId);
   if (!cust?.customer_name || !cust?.address_text) {
     setS(userId, { ...s, step: 'ASK_NAME', profileMode: false });
-    return ctx.reply('Escriu el teu **Nom i Cognoms**:', { parse_mode: 'Markdown' });
+    return ctx.reply('Escriu el teu Nom i Cognoms:');
   }
 
   // 4) Total robust
-  const total = cart.reduce((acc, it) => {
-    const price = Number(it.price_cents) || 0;
-    const qty = Number(it.qty) || 1;
-    return acc + price * qty;
-  }, 0);
+  const total = cart.reduce((acc, it) => (acc + (Number(it.price_cents) || 0) * (Number(it.qty) || 1)), 0);
 
-  // 5) Desa la comanda amb ITEMS reals
-  await db.insertOrder({
+  // 5) Desa la comanda i recupera id
+  const row = await db.insertOrder({
     user_id: userId,
     username,
     items: cart,
@@ -528,12 +524,31 @@ async function finalizeOrder(ctx) {
     address_text: cust.address_text,
     status: 'PENDING'
   });
+  const orderId = row?.id;
 
   // 6) Neteja cistella (memòria + BD)
   setS(userId, { ...s, cart: [] });
   try { await db.saveCart(userId, username, []); } catch (e) { console.error('saveCart after order error:', e.message); }
 
-  // 7) Confirmació al client
+  // 7) Avís als ADMIN_CHAT_IDS amb el detall dels productes (sense Markdown)
+  if (ADMIN_CHAT_IDS.length) {
+    const lines = cart.map(it =>
+      `• ${it.productName} — talla ${it.size} ×${it.qty} = ${toEuro((Number(it.price_cents)||0)*(Number(it.qty)||1))}`
+    ).join('\n') || '(cap)';
+    const msg =
+      `NOVA COMANDA #${orderId ?? '?'}\n` +
+      `Client: ${cust.customer_name}\n` +
+      `Usuari: ${username ? '@'+username : userId}\n` +
+      `Adreça:\n${cust.address_text}\n\n` +
+      `Productes:\n${lines}\n\n` +
+      `Total: ${toEuro(total)}`;
+    for (const chatId of ADMIN_CHAT_IDS) {
+      try { await bot.telegram.sendMessage(chatId, msg, { disable_web_page_preview: true }); }
+      catch (e) { console.error('Admin notify fail:', e.message); }
+    }
+  }
+
+  // 8) Confirmació al client
   try {
     await ctx.editMessageText(`✅ Comanda registrada! Import: ${toEuro(total)}. Et contactarem per pagament i enviament.`);
   } catch {

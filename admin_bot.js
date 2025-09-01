@@ -63,39 +63,51 @@ admin.hears('📝 Consultes clients', async (ctx) => {
 const WATCH_MS = Number(process.env.WATCH_INTERVAL_MS || 4000);
 
 async function notifyNewOrders() {
-  const rows = (await pool.query(
-    `SELECT * FROM orders WHERE notified_at IS NULL ORDER BY id ASC LIMIT 20`
-  )).rows;
+  try {
+    const rows = (await pool.query(
+      `SELECT * FROM orders WHERE notified_at IS NULL ORDER BY id ASC LIMIT 20`
+    )).rows;
 
-  for (const o of rows) {
-    let items = [];
-    try { items = JSON.parse(o.items_json || '[]'); } catch {}
+    for (const o of rows) {
+      let items = [];
+      try { items = JSON.parse(o.items_json || '[]'); } catch {}
 
-    const lines = items.map(it => {
-      const qty = it.qty || 1;
-      const line = (it.price_cents || 0) * qty;
-      return `• ${it.productName} — talla ${it.size} ×${qty} — ${toEuro(line)}`;
-    }).join('\n');
+      const lines = items.map(it => {
+        const qty = it.qty || 1;
+        const line = (it.price_cents || 0) * qty;
+        return `• ${it.productName} — talla ${it.size} ×${qty} — ${toEuro(line)}`;
+      }).join('\n');
 
-    const who = o.customer_name || (o.username ? `@${o.username}` : `${o.user_id}`);
-    const msg = [
-      `🆕 *NOVA COMANDA* #${o.id}`,
-      `👤 Client: *${who}*`,
-      `🔗 Usuari: ${o.username ? '@'+o.username : o.user_id}`,
-      `📍 Adreça:\n${o.address_text || '(no informada)'}`,
-      ``,
-      `📦 Productes:`,
-      lines || '(buit)',
-      ``,
-      `💶 Total: *${toEuro(o.total_cents)}*`,
-      `🕒 ${new Date(o.created_at).toLocaleString('es-ES')}`
-    ].join('\n');
+      const who = o.customer_name || (o.username ? `@${o.username}` : `${o.user_id}`);
 
-    for (const aid of ADMIN_IDS) {
-      try { await admin.telegram.sendMessage(aid, msg, { parse_mode:'Markdown' }); } catch (e) {
-        console.error('Send fail to', aid, e.message);
+      const msg = [
+        `🆕 NOVA COMANDA #${o.id}`,
+        `👤 Client: ${who}`,
+        `🔗 Usuari: ${o.username ? '@'+o.username : o.user_id}`,
+        `📍 Adreça:\n${o.address_text || '(no informada)'}`,
+        ``,
+        `📦 Productes:`,
+        lines || '(buit)',
+        ``,
+        `💶 Total: ${toEuro(o.total_cents)}`,
+        `🕒 ${new Date(o.created_at).toLocaleString('es-ES')}`
+      ].join('\n');
+
+      for (const aid of ADMIN_IDS) {
+        try {
+          await admin.telegram.sendMessage(aid, msg); // ← sense parse_mode
+        } catch (e) {
+          console.error(`Send fail to ${aid}`, e.message);
+        }
       }
+
+      await pool.query(`UPDATE orders SET notified_at = now() WHERE id=$1`, [o.id]);
     }
+  } catch (e) {
+    console.error('notifyNewOrders error', e.message);
+  }
+}
+
     // marca com notificat
     await pool.query(`UPDATE orders SET notified_at = now() WHERE id=$1`, [o.id]);
   }
@@ -131,3 +143,4 @@ if (USE_WEBHOOK) {
 }
 process.once('SIGINT',  () => { try { admin.stop('SIGINT');  } catch {} });
 process.once('SIGTERM', () => { try { admin.stop('SIGTERM'); } catch {} });
+

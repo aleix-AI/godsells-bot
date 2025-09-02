@@ -9,7 +9,7 @@
   "scripts": {
     "start:customer": "node customer_bot.js",
     "start:admin": "node admin_bot.js",
-    "start:importer": "node scrape_platanos.js"
+    "start:importer": "node scrape_platanos.js && node tag_all.js"
   },
   "dependencies": {
     "axios": "^1.7.2",
@@ -20,3 +20,4 @@
     "telegraf": "^4.16.3"
   }
 }
+

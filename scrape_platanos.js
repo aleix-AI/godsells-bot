@@ -1,4 +1,4 @@
-// scrape_platanos.js — Importador platanosneaker: preus + imatges
+// scrape_platanos.js — Importador platanosneaker: preus + imatges (Shopify + fallback)
 import 'dotenv/config';
 import axios from 'axios';
 import * as cheerio from 'cheerio';
@@ -7,7 +7,7 @@ const { Pool } = pkg;
 
 /* ───────── Config ───────── */
 const ROOT = (process.env.TARGET_URL || 'https://platanosneaker.com').replace(/\/+$/, '');
-const MAX_PAGES = Number(process.env.MAX_PAGES || 500);   // límit de pàgines a rastrejar
+const MAX_PAGES = Number(process.env.MAX_PAGES || 500);
 const CONCURRENCY = 4;
 
 const pool = new Pool({
@@ -63,9 +63,9 @@ function sameHost(u) {
   try { return new URL(u).host === new URL(ROOT).host; } catch { return false; }
 }
 function parsePriceCents(str) {
-  if (!str) return null;
+  if (!str && str !== 0) return null;
+  if (typeof str === 'number') return Math.round(str);
   const s = String(str).replace(/\s/g, '');
-  // exemples: 129,95 · 129.95 · 12995 · 129
   const m = s.match(/(\d{1,6}[.,]\d{1,2}|\d{1,6})/g);
   if (!m) return null;
   const raw = m[m.length - 1].replace('.', ',');
@@ -87,7 +87,49 @@ async function fetchHTML(url) {
   return res.data;
 }
 
-/* ───────── Parsers ───────── */
+function firstNonEmpty(...arr) {
+  for (const v of arr) if (v && String(v).trim()) return String(v).trim();
+  return '';
+}
+
+/* ───────── Shopify shortcut ───────── */
+async function tryShopifyJSON(productUrl) {
+  // Shopify exposeix JSON a /products/<handle>.js
+  const u = productUrl.replace(/\?.*$/, '');
+  if (!/\/products\//.test(u)) return null;
+  const jsonUrl = u + '.js';
+  try {
+    const res = await axios.get(jsonUrl, { validateStatus: s => s >= 200 && s < 400, timeout: 15000 });
+    const p = res.data || {};
+    const title = p.title || '';
+    let img = p.featured_image || (Array.isArray(p.images) && p.images[0]) || '';
+    if (img) img = absolute(img);
+
+    let priceCents = null;
+    if (typeof p.price !== 'undefined') {
+      priceCents = parsePriceCents(p.price);
+    } else if (Array.isArray(p.variants) && p.variants.length) {
+      const v = p.variants.find(v => v.available) || p.variants[0];
+      const val = typeof v?.price !== 'undefined' ? v.price : v?.compare_at_price;
+      priceCents = parsePriceCents(val);
+    }
+
+    const brand = p.vendor || '';
+    const description = (p.body_html || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+
+    return {
+      title,
+      image_url: img || '',
+      price_cents: priceCents ?? null,
+      brand,
+      description
+    };
+  } catch {
+    return null;
+  }
+}
+
+/* ───────── Parsers clàssics ───────── */
 function parseListing(html) {
   const $ = cheerio.load(html);
   const links = new Set();
@@ -107,12 +149,38 @@ function parseListing(html) {
   return Array.from(links);
 }
 
-function firstNonEmpty(...arr) {
-  for (const v of arr) if (v && String(v).trim()) return String(v).trim();
-  return '';
+function parseJSONLD($) {
+  let priceCents = null;
+  let image = null;
+  $('script[type="application/ld+json"]').each((_, s) => {
+    try {
+      const txt = $(s).contents().text();
+      if (!txt) return;
+      const json = JSON.parse(txt);
+      const bucket = Array.isArray(json) ? json : [json];
+      for (const obj of bucket) {
+        if (obj && (obj['@type'] === 'Product' || obj['@type']?.includes?.('Product'))) {
+          if (!image) {
+            const img = Array.isArray(obj.image) ? obj.image[0] : obj.image;
+            if (img) image = String(img);
+          }
+          const offers = obj.offers || obj.aggregateOffer || obj.aggregateOffers;
+          if (offers) {
+            const arr = Array.isArray(offers) ? offers : [offers];
+            for (const ofr of arr) {
+              if (!priceCents && (ofr.price || ofr.priceSpecification?.price)) {
+                priceCents = parsePriceCents(ofr.price || ofr.priceSpecification?.price);
+              }
+            }
+          }
+        }
+      }
+    } catch {}
+  });
+  return { priceCents, image };
 }
 
-function parseProduct(html, url) {
+function parseProductFallback(html, url) {
   const $ = cheerio.load(html);
 
   const title = firstNonEmpty(
@@ -120,15 +188,15 @@ function parseProduct(html, url) {
     $('h1').first().text()
   );
 
-  // preu: prova meta i etiquetes visibles
+  const { priceCents: ldPrice, image: ldImage } = parseJSONLD($);
   const priceCents =
+    ldPrice ??
     parsePriceCents($('meta[property="product:price:amount"]').attr('content')) ??
     parsePriceCents($('[itemprop="price"]').attr('content')) ??
     parsePriceCents($('.price, .product-price, .price__container, .price-item').text());
 
-  // imatge principal (og:image o primera d’un possible CDN shopify)
   const ogImg = $('meta[property="og:image"]').attr('content');
-  let img = absolute(ogImg);
+  let img = absolute(ldImage || ogImg);
   if (!img) {
     img =
       absolute($('img[src*="cdn.shopify.com"]').attr('src')) ||
@@ -183,15 +251,13 @@ async function crawl() {
     try {
       const html = await fetchHTML(url);
       const links = parseListing(html);
-
       for (const u of links) {
         if (u.includes('/products/')) productUrls.add(u);
-        if (!seen.has(u) && !u.includes('/products/')) queue.push(u); // segueix rastreig per llistats
+        if (!seen.has(u) && !u.includes('/products/')) queue.push(u);
       }
     } catch (e) {
       console.error('Fetch listing error:', url, e.message);
     }
-
     await sleep(200);
   }
 
@@ -203,8 +269,27 @@ async function crawl() {
   async function worker(slice) {
     for (const url of slice) {
       try {
-        const html = await fetchHTML(url);
-        const prod = parseProduct(html, url);
+        // 1) Prova JSON de Shopify
+        const sj = await tryShopifyJSON(url);
+
+        let prod;
+        if (sj && (sj.price_cents || sj.image_url)) {
+          // si tenim JSON fiable, muntem producte amb aquesta info
+          const html = await fetchHTML(url); // per categoria/breadcrumb i og:title
+          const fallback = parseProductFallback(html, url);
+          prod = {
+            ...fallback,
+            name: sj.title || fallback.name,
+            image_url: sj.image_url || fallback.image_url,
+            base_price_cents: sj.price_cents ?? fallback.base_price_cents,
+            brand: sj.brand || fallback.brand
+          };
+        } else {
+          // 2) Fallback clàssic
+          const html = await fetchHTML(url);
+          prod = parseProductFallback(html, url);
+        }
+
         await upsertProduct(prod);
         ok++;
       } catch (e) {

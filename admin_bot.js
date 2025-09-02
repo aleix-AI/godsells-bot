@@ -1,163 +1,134 @@
-// admin_bot.js — Notificacions automàtiques de comandes (text pla, sense parse_mode)
+// admin_bot.js — watcher de comandes i missatge amb productes
 import 'dotenv/config';
-import { Telegraf, Markup } from 'telegraf';
+import { Telegraf } from 'telegraf';
 import pkg from 'pg';
 const { Pool } = pkg;
 
-/* ───────── DB ───────── */
+/* ───────── Config ───────── */
+const ADMIN_BOT_TOKEN = process.env.ADMIN_BOT_TOKEN;
+if (!ADMIN_BOT_TOKEN) throw new Error('Falta ADMIN_BOT_TOKEN');
+
+const ADMIN_IDS = (process.env.ADMIN_IDS || process.env.ADMIN_USER_ID || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.PGSSLMODE === 'require' ? { rejectUnauthorized: false } : false
 });
 
-async function ensureSchema() {
-  await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS total_cost_cents INT DEFAULT 0;`);
-  await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS customer_name TEXT;`);
-  await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS address_text TEXT;`);
-  await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'PENDING';`);
-  await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT now();`);
-  await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS notified_at TIMESTAMPTZ;`);
-}
-await ensureSchema();
+const bot = new Telegraf(ADMIN_BOT_TOKEN);
 
-/* ───────── Bot ───────── */
-const ADMIN_BOT_TOKEN = process.env.ADMIN_BOT_TOKEN;
-const ADMIN_IDS = (process.env.ADMIN_IDS || '')
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean);
+const toEuro = (cents) =>
+  (Number(cents || 0) / 100).toLocaleString('es-ES', { style: 'currency', currency: 'EUR' });
 
-if (!ADMIN_BOT_TOKEN) throw new Error('Falta ADMIN_BOT_TOKEN');
-if (!ADMIN_IDS.length) console.warn('⚠️  ADMIN_IDS buit: no s’enviarà cap notificació.');
-
-const admin = new Telegraf(ADMIN_BOT_TOKEN);
 const isAdmin = (ctx) => ADMIN_IDS.includes(String(ctx.from.id));
-const toEuro = (c) => (Number(c || 0) / 100).toLocaleString('es-ES', { style: 'currency', currency: 'EUR' });
 
-/* ───────── UI ───────── */
-admin.start((ctx) => {
-  if (!isAdmin(ctx)) return ctx.reply('No autoritzat.');
-  ctx.reply(
-    '🛠️ Admin en marxa',
-    Markup.keyboard([
-      ['📦 Comandes pendents', '📝 Consultes clients'],
-      ['🔔 Provar notificació (/forcecheck)']
-    ]).resize()
-  );
-});
+/* ───────── Utils ───────── */
+function itemsFromRow(order) {
+  const src = order?.items_json;
+  if (!src) return [];
+  if (Array.isArray(src)) return src;                 // jsonb[] ja deserialitzat
+  if (typeof src === 'object') return src;            // jsonb (array objecte)
+  try { return JSON.parse(src); } catch { return []; } // text -> JSON
+}
 
-admin.hears('📦 Comandes pendents', async (ctx) => {
-  if (!isAdmin(ctx)) return;
-  const rows = (
-    await pool.query(
-      `SELECT id, created_at, username, customer_name, total_cents, status
-       FROM orders
-       WHERE status='PENDING'
-       ORDER BY id DESC
-       LIMIT 50`
-    )
-  ).rows;
-  if (!rows.length) return ctx.reply('Sense comandes pendents.');
-  const text = rows
-    .map(
-      (o) =>
-        `#${o.id} — ${new Date(o.created_at).toLocaleString('es-ES')} — ${o.customer_name || o.username || o.user_id} — ${toEuro(o.total_cents)} — ${o.status}`
-    )
-    .join('\n')
-    .slice(0, 4000);
-  ctx.reply(text);
-});
+function formatOrderMessage(o) {
+  const items = itemsFromRow(o);
+  const lines = items.map(it => {
+    const p = Number(it.price_cents) || 0;
+    const q = Number(it.qty) || 1;
+    return `• ${it.productName} — talla ${it.size} ×${q} = ${toEuro(p * q)}`;
+  });
+  const itemsBlock = lines.length ? lines.join('\n') : '(buit)';
 
-admin.hears('📝 Consultes clients', async (ctx) => {
-  if (!isAdmin(ctx)) return;
-  const rows = (await pool.query('SELECT * FROM queries ORDER BY id DESC LIMIT 200')).rows;
-  if (!rows.length) return ctx.reply('Sense consultes.');
-  const text = rows
-    .slice(0, 30)
-    .map((q) => `${new Date(q.created_at).toLocaleString('es-ES')} — ${q.username || q.user_id}: ${q.text}`)
-    .join('\n');
-  ctx.reply(text);
-});
+  const userStr = o.username ? `@${o.username}` : String(o.user_id);
+  return [
+    `🆕 NOVA COMANDA #${o.id}`,
+    `🧑‍💼 Client: ${o.customer_name || '-'}`,
+    `🪪 Usuari: ${userStr}`,
+    `📍 Adreça:`,
+    `${o.address_text || '-'}`,
+    ``,
+    `📦 Productes:`,
+    `${itemsBlock}`,
+    ``,
+    `💶 Total: ${toEuro(o.total_cents)}`
+  ].join('\n');
+}
 
-/* ───────── Notificador ───────── */
-const WATCH_MS = Number(process.env.WATCH_INTERVAL_MS || 4000);
-
-async function notifyNewOrders() {
+/* ───────── Comandes ───────── */
+async function watchNewOrders() {
   try {
-    const rows = (
-      await pool.query(
-        `SELECT * FROM orders WHERE notified_at IS NULL ORDER BY id ASC LIMIT 20`
-      )
-    ).rows;
+    const res = await pool.query(
+      `SELECT id, user_id, username, items_json, total_cents, customer_name, address_text, created_at
+         FROM orders
+        WHERE notified_at IS NULL
+        ORDER BY id ASC
+        LIMIT 20`
+    );
 
-    for (const o of rows) {
-      let items = [];
-      try { items = JSON.parse(o.items_json || '[]'); } catch { items = []; }
+    for (const o of res.rows) {
+      const msg = formatOrderMessage(o);
 
-      // Línies d'articles
-      let lines = '';
-      for (const it of items) {
-        const qty = it.qty || 1;
-        const lineTotal = (it.price_cents || 0) * qty;
-        lines += `• ${it.productName} — talla ${it.size} ×${qty} — ${toEuro(lineTotal)}\n`;
-      }
-      if (!lines) lines = '(buit)\n';
-
-      const who = o.customer_name || (o.username ? `@${o.username}` : `${o.user_id}`);
-
-      // Missatge en text pla (sense Markdown/HTML)
-      let msg = '';
-      msg += `🆕 NOVA COMANDA #${o.id}\n`;
-      msg += `👤 Client: ${who}\n`;
-      msg += `🔗 Usuari: ${o.username ? '@' + o.username : o.user_id}\n`;
-      msg += `📍 Adreça:\n${o.address_text || '(no informada)'}\n\n`;
-      msg += `📦 Productes:\n${lines}\n`;
-      msg += `💶 Total: ${toEuro(o.total_cents)}\n`;
-      msg += `🕒 ${new Date(o.created_at).toLocaleString('es-ES')}`;
-
-      for (const aid of ADMIN_IDS) {
-        try {
-          await admin.telegram.sendMessage(aid, msg); // text pla
-        } catch (e) {
-          console.error(`Send fail to ${aid}`, e.message);
-        }
+      // envia a tots els admins; sense parse_mode
+      for (const adminId of ADMIN_IDS) {
+        try { await bot.telegram.sendMessage(adminId, msg, { disable_web_page_preview: true }); }
+        catch (e) { console.error('Send fail to', adminId, e.message); }
       }
 
-      await pool.query(`UPDATE orders SET notified_at = now() WHERE id=$1`, [o.id]);
+      // marca com a notificat
+      try { await pool.query('UPDATE orders SET notified_at = now() WHERE id = $1', [o.id]); }
+      catch (e) { console.error('Mark notified error for', o.id, e.message); }
     }
   } catch (e) {
-    console.error('notifyNewOrders error', e.message);
+    console.error('watchNewOrders error:', e.message);
   }
 }
 
-admin.command('forcecheck', async (ctx) => {
-  if (!isAdmin(ctx)) return;
-  await notifyNewOrders();
-  ctx.reply('🔔 Check forçat fet.');
+/* ───────── Bot UI ───────── */
+bot.start((ctx) => {
+  if (!isAdmin(ctx)) return ctx.reply('No autoritzat.');
+  ctx.reply('🛠️ Admin en marxa. Rebràs notificacions de noves comandes aquí.');
 });
 
-setInterval(() => {
-  notifyNewOrders().catch((e) => console.error('notify error', e.message));
-}, WATCH_MS);
+bot.command('ping', (ctx) => {
+  if (!isAdmin(ctx)) return;
+  ctx.reply('pong');
+});
 
-/* ───────── Arrencada ───────── */
+bot.command('orders', async (ctx) => {
+  if (!isAdmin(ctx)) return;
+  const r = await pool.query(`SELECT id, total_cents, customer_name, created_at
+                                FROM orders ORDER BY id DESC LIMIT 10`);
+  if (!r.rows.length) return ctx.reply('Sense comandes.');
+  const txt = r.rows
+    .map(o => `#${o.id} — ${toEuro(o.total_cents)} — ${o.customer_name || '-'} — ${new Date(o.created_at).toLocaleString('es-ES')}`)
+    .join('\n');
+  ctx.reply(txt);
+});
+
+/* ───────── Infra (webhook / polling) ───────── */
 const USE_WEBHOOK = String(process.env.USE_WEBHOOK).toLowerCase() === 'true';
 const PORT = Number(process.env.PORT || 3000);
-const APP_URL = process.env.APP_URL;
+const APP_URL = process.env.APP_URL;              // ex: https://<subdomini-admin>.up.railway.app
 const HOOK_PATH = process.env.HOOK_PATH || '/tghook';
 
 if (USE_WEBHOOK) {
   const express = (await import('express')).default;
   const app = express();
-  app.use(admin.webhookCallback(HOOK_PATH));
+  app.use(bot.webhookCallback(HOOK_PATH));
   if (!APP_URL) throw new Error('Falta APP_URL per al webhook');
-  await admin.telegram.setWebhook(`${APP_URL}${HOOK_PATH}`);
+  await bot.telegram.setWebhook(`${APP_URL}${HOOK_PATH}`);
   app.get('/', (_, res) => res.send('OK'));
   app.listen(PORT, () => console.log('Admin listening on', PORT));
 } else {
-  await admin.launch();
+  await bot.launch();
   console.log('Admin bot running (long polling)');
 }
+process.once('SIGINT', () => { try { bot.stop('SIGINT'); } catch {} });
+process.once('SIGTERM', () => { try { bot.stop('SIGTERM'); } catch {} });
 
-process.once('SIGINT', () => { try { admin.stop('SIGINT'); } catch {} });
-process.once('SIGTERM', () => { try { admin.stop('SIGTERM'); } catch {} });
+/* ───────── Loop del watcher ───────── */
+setInterval(watchNewOrders, 7000); // cada 7s comprova noves comandes

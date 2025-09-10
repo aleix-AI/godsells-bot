@@ -1,8 +1,16 @@
-// customer_bot.js — Cistella persistent, notificació admins i talles per categoria
+// customer_bot.js — Cistella persistent, talles per categoria, i pagament PayPal (sense confirmació manual)
 import 'dotenv/config';
 import { Telegraf, Markup } from 'telegraf';
 import pkg from 'pg';
 const { Pool } = pkg;
+
+/* ───────── Config PayPal ───────── */
+const PAYPAL_MODE = (process.env.PAYPAL_MODE || 'sandbox').toLowerCase(); // 'sandbox' | 'live'
+const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID || '';
+const PAYPAL_SECRET = process.env.PAYPAL_SECRET || '';
+const PAYPAL_API_BASE = PAYPAL_MODE === 'live'
+  ? 'https://api-m.paypal.com'
+  : 'https://api-m.sandbox.paypal.com';
 
 /* ───────── DB ───────── */
 const pool = new Pool({
@@ -24,6 +32,12 @@ async function ensureSchema() {
   await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'PENDING';`);
   await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT now();`);
   await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS notified_at TIMESTAMPTZ;`);
+  // Pagament
+  await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_provider TEXT;`);
+  await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'UNPAID';`); // UNPAID|CREATED|PAID|CANCELLED
+  await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_id TEXT;`); // PayPal order id
+  await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_receipt_json JSONB;`);
+  await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS paid_at TIMESTAMPTZ;`);
 
   // Taula de consultes
   await pool.query(`
@@ -92,11 +106,28 @@ const db = {
 
   insertOrder: async (o) =>
     (await pool.query(
-      `INSERT INTO orders(user_id, username, items_json, total_cents, total_cost_cents, customer_name, address_text, status)
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+      `INSERT INTO orders(user_id, username, items_json, total_cents, total_cost_cents, customer_name, address_text, status, payment_provider, payment_status, payment_id)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
        RETURNING id, created_at`,
-      [o.user_id, o.username, JSON.stringify(o.items), o.total_cents, o.total_cost_cents || 0, o.customer_name || '', o.address_text || '', o.status || 'PENDING']
+      [o.user_id, o.username, JSON.stringify(o.items), o.total_cents, o.total_cost_cents || 0, o.customer_name || '', o.address_text || '', o.status || 'PENDING',
+       o.payment_provider || null, o.payment_status || 'UNPAID', o.payment_id || null]
     )).rows[0],
+
+  setOrderPaymentInfo: async (orderId, fields) => {
+    const { payment_status, payment_id, payment_receipt_json, paid_at } = fields;
+    await pool.query(
+      `UPDATE orders
+         SET payment_status = COALESCE($2, payment_status),
+             payment_id = COALESCE($3, payment_id),
+             payment_receipt_json = COALESCE($4, payment_receipt_json),
+             paid_at = COALESCE($5, paid_at)
+       WHERE id = $1`,
+      [orderId, payment_status || null, payment_id || null, payment_receipt_json ? JSON.stringify(payment_receipt_json) : null, paid_at || null]
+    );
+  },
+
+  getOrderById: async (id) =>
+    (await pool.query(`SELECT * FROM orders WHERE id=$1`, [id])).rows[0],
 
   insertQuery: async (user_id, username, text) =>
     pool.query('INSERT INTO queries(user_id, username, text) VALUES($1,$2,$3)', [user_id, username, text]),
@@ -477,6 +508,7 @@ async function showOrEditProfile(ctx) {
 bot.action('EDIT_NAME', async (ctx) => { await ctx.answerCbQuery(); const s = getS(ctx.from.id); setS(ctx.from.id, { ...s, step: 'ASK_NAME', profileMode: true }); ctx.reply('Escriu el teu Nom i Cognoms:'); });
 bot.action('EDIT_ADDR', async (ctx) => { await ctx.answerCbQuery(); const s = getS(ctx.from.id); setS(ctx.from.id, { ...s, step: 'ASK_ADDR', profileMode: true }); ctx.reply('Escriu l’adreça completa d’enviament:'); });
 
+/* ───────── Checkout ───────── */
 bot.action('CHECKOUT', async (ctx) => {
   await ctx.answerCbQuery();
   const s = getS(ctx.from.id);
@@ -488,9 +520,11 @@ bot.action('CHECKOUT', async (ctx) => {
 
   const cust = await db.getCustomer(ctx.from.id);
   if (cust?.customer_name && cust?.address_text) {
-    const msg = `Farem servir aquestes dades?\n\n${cust.customer_name}\n${cust.address_text}`;
+    const { text, total } = cartText(getS(ctx.from.id).cart || []);
+    const msg = `${text}\n\nFarem servir aquestes dades?\n${cust.customer_name}\n${cust.address_text}\n\nImport: ${toEuro(total)}`;
     const kb = Markup.inlineKeyboard([
-      [Markup.button.callback('✅ Sí, confirmar', 'CONFIRM_PROFILE'), Markup.button.callback('✏️ Canviar', 'EDIT_PROFILE')]
+      [Markup.button.callback('✅ Sí, continuar a pagament', 'CONFIRM_PROFILE')],
+      [Markup.button.callback('✏️ Canviar dades', 'EDIT_PROFILE')]
     ]);
     return ctx.reply(msg, kb);
   }
@@ -500,48 +534,112 @@ bot.action('CHECKOUT', async (ctx) => {
 bot.action('EDIT_PROFILE', async (ctx) => { await ctx.answerCbQuery(); const s = getS(ctx.from.id); setS(ctx.from.id, { ...s, step: 'ASK_NAME', profileMode: false }); ctx.reply('Escriu el teu Nom i Cognoms:'); });
 bot.action('CONFIRM_PROFILE', async (ctx) => { await ctx.answerCbQuery(); return finalizeOrder(ctx); });
 
-bot.on('text', async (ctx, next) => {
-  const s = getS(ctx.from.id);
-  if (s.step !== 'ASK_NAME') return next();
-  const name = ctx.message.text.trim().slice(0, 120);
-  setS(ctx.from.id, { ...s, temp_name: name, step: 'ASK_ADDR' });
-  return ctx.reply('Ara escriu l’adreça completa d’enviament (carrer, número, porta, CP, ciutat):');
-});
-bot.on('text', async (ctx, next) => {
-  const s = getS(ctx.from.id);
-  if (s.step !== 'ASK_ADDR') return next();
-  const addr = ctx.message.text.trim().slice(0, 400);
-  const name = s.temp_name || '';
-  await db.upsertCustomer(ctx.from.id, ctx.from.username || '', name, addr);
-  if (s.profileMode) {
-    setS(ctx.from.id, { ...s, step: null, temp_name: null });
-    return ctx.reply('✅ Dades guardades.');
-  } else {
-    setS(ctx.from.id, { ...s, step: null, temp_name: null });
-    return finalizeOrder(ctx);
-  }
-});
+/* ───────── PayPal helpers ───────── */
+async function paypalAccessToken() {
+  if (!PAYPAL_CLIENT_ID || !PAYPAL_SECRET) throw new Error('Falten credencials PayPal');
+  const res = await fetch(`${PAYPAL_API_BASE}/v1/oauth2/token`, {
+    method: 'POST',
+    headers: {
+      'Authorization': 'Basic ' + Buffer.from(`${PAYPAL_CLIENT_ID}:${PAYPAL_SECRET}`).toString('base64'),
+      'Content-Type': 'application/x-www-form-urlencoded'
+    },
+    body: 'grant_type=client_credentials'
+  });
+  if (!res.ok) throw new Error('PayPal OAuth error');
+  const json = await res.json();
+  return json.access_token;
+}
 
-/* ───────── Finalitzar comanda (cistella des de BD i avís admins) ───────── */
+async function paypalCreateOrder(ourOrderId, totalCents, description, returnBaseUrl) {
+  const access = await paypalAccessToken();
+  const return_url = `${returnBaseUrl}/paypal/return?order_id=${ourOrderId}`;
+  const cancel_url = `${returnBaseUrl}/paypal/cancel?order_id=${ourOrderId}`;
+  const body = {
+    intent: 'CAPTURE',
+    purchase_units: [{
+      amount: { currency_code: 'EUR', value: (totalCents / 100).toFixed(2) },
+      description: description?.slice(0, 120) || `Order #${ourOrderId}`
+    }],
+    application_context: {
+      return_url,
+      cancel_url,
+      user_action: 'PAY_NOW',
+      brand_name: 'La teva botiga'
+    }
+  };
+  const res = await fetch(`${PAYPAL_API_BASE}/v2/checkout/orders`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${access}` },
+    body: JSON.stringify(body)
+  });
+  if (!res.ok) {
+    const t = await res.text().catch(()=> '');
+    throw new Error(`PayPal create error: ${t}`);
+  }
+  return res.json(); // { id, links:[{rel:'approve', href:...}] }
+}
+
+async function paypalCaptureOrder(paypalOrderId) {
+  const access = await paypalAccessToken();
+  const res = await fetch(`${PAYPAL_API_BASE}/v2/checkout/orders/${paypalOrderId}/capture`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${access}` }
+  });
+  if (!res.ok) {
+    const t = await res.text().catch(()=> '');
+    throw new Error(`PayPal capture error: ${t}`);
+  }
+  return res.json();
+}
+
+/* ───────── Notificació a Admins (només després de pagar) ───────── */
+async function notifyAdminsOfOrder(order) {
+  if (!ADMIN_CHAT_IDS.length) return;
+  let items = [];
+  try { items = Array.isArray(order.items_json) ? order.items_json : JSON.parse(order.items_json || '[]'); } catch {}
+  const lines = items.map(it => {
+    const label = it.size ? ` — talla ${it.size}` : '';
+    return `• ${it.productName}${label} ×${it.qty} = ${toEuro((Number(it.price_cents)||0)*(Number(it.qty)||1))}`;
+  }).join('\n') || '(cap)';
+
+  const msg =
+    `COMANDA #${order.id}\n` +
+    `Estat: ${order.status || 'PENDING'} — Pagament: ${order.payment_status || 'UNPAID'}\n` +
+    `Client: ${order.customer_name}\n` +
+    `Usuari: ${order.username ? '@'+order.username : order.user_id}\n` +
+    `Adreça:\n${order.address_text}\n\n` +
+    `Productes:\n${lines}\n\n` +
+    `Total: ${toEuro(order.total_cents)}`;
+
+  for (const chatId of ADMIN_CHAT_IDS) {
+    try { await bot.telegram.sendMessage(chatId, msg, { disable_web_page_preview: true }); }
+    catch (e) { console.error('Admin notify fail:', e.message); }
+  }
+}
+
+/* ───────── Finalitzar comanda (crea ordre i OBLIGA a PayPal) ───────── */
 async function finalizeOrder(ctx) {
   const userId = ctx.from.id;
   const username = ctx.from.username || '';
 
+  // Llegeix cistella de BD
   let persisted = [];
   try { persisted = await db.loadCart(userId); } catch (e) { console.error('loadCart error:', e.message); }
-
   const s = getS(userId);
   let cart = Array.isArray(persisted) && persisted.length ? persisted : (s.cart || []);
   if (!cart.length) return ctx.reply('La cistella és buida.');
 
+  // Dades del client
   const cust = await db.getCustomer(userId);
   if (!cust?.customer_name || !cust?.address_text) {
     setS(userId, { ...s, step: 'ASK_NAME', profileMode: false });
     return ctx.reply('Escriu el teu Nom i Cognoms:');
   }
 
+  // Total
   const total = cart.reduce((acc, it) => (acc + (Number(it.price_cents) || 0) * (Number(it.qty) || 1)), 0);
 
+  // Desa la comanda com UNPAID
   const row = await db.insertOrder({
     user_id: userId,
     username,
@@ -550,40 +648,36 @@ async function finalizeOrder(ctx) {
     total_cost_cents: 0,
     customer_name: cust.customer_name,
     address_text: cust.address_text,
-    status: 'PENDING'
+    status: 'PENDING',
+    payment_provider: 'paypal',
+    payment_status: 'UNPAID'
   });
   const orderId = row?.id;
 
+  // Neteja cistella (ja hem creat comanda)
   setS(userId, { ...s, cart: [] });
   try { await db.saveCart(userId, username, []); } catch (e) { console.error('saveCart after order error:', e.message); }
 
-  // Avís admins
-  if (ADMIN_CHAT_IDS.length) {
-    const lines = cart.map(it => {
-      const label = it.size ? ` — talla ${it.size}` : '';
-      return `• ${it.productName}${label} ×${it.qty} = ${toEuro((Number(it.price_cents)||0)*(Number(it.qty)||1))}`;
-    }).join('\n') || '(cap)';
-    const msg =
-      `NOVA COMANDA #${orderId ?? '?'}\n` +
-      `Client: ${cust.customer_name}\n` +
-      `Usuari: ${username ? '@'+username : userId}\n` +
-      `Adreça:\n${cust.address_text}\n\n` +
-      `Productes:\n${lines}\n\n` +
-      `Total: ${toEuro(total)}`;
-    for (const chatId of ADMIN_CHAT_IDS) {
-      try { await bot.telegram.sendMessage(chatId, msg, { disable_web_page_preview: true }); }
-      catch (e) { console.error('Admin notify fail:', e.message); }
-    }
+  // Inicia PayPal
+  if (!process.env.APP_URL) {
+    return ctx.reply('Error de configuració: falta APP_URL');
   }
-
   try {
-    await ctx.editMessageText(`✅ Comanda registrada! Import: ${toEuro(total)}. Et contactarem per pagament i enviament.`);
-  } catch {
-    await ctx.reply(`✅ Comanda registrada! Import: ${toEuro(total)}. Et contactarem per pagament i enviament.`);
+    const info = await paypalCreateOrder(orderId, total, `Order #${orderId}`, process.env.APP_URL);
+    const approve = (info.links || []).find(l => l.rel === 'approve')?.href;
+    await db.setOrderPaymentInfo(orderId, { payment_status: 'CREATED', payment_id: info.id });
+    if (!approve) throw new Error('No s’ha rebut enllaç d’aprovació');
+    await ctx.reply(
+      `Comanda #${orderId} creada.\nAra paga ${toEuro(total)} a PayPal per confirmar la comanda.`,
+      Markup.inlineKeyboard([[Markup.button.url('🌐 Obrir PayPal', approve)]])
+    );
+  } catch (e) {
+    console.error('PayPal create fail:', e.message);
+    await ctx.reply('No s’ha pogut iniciar el pagament amb PayPal ara mateix. Torna a /cistella i prova de nou en uns minuts.');
   }
 }
 
-/* ───────── Infra ───────── */
+/* ───────── Infra (webhook / express + rutes PayPal) ───────── */
 const USE_WEBHOOK = String(process.env.USE_WEBHOOK).toLowerCase() === 'true';
 const PORT = Number(process.env.PORT || 3000);
 const APP_URL = process.env.APP_URL;
@@ -592,9 +686,65 @@ const HOOK_PATH = process.env.HOOK_PATH || '/tghook';
 if (USE_WEBHOOK) {
   const express = (await import('express')).default;
   const app = express();
+
+  // Rutes PayPal: return/cancel
+  app.get('/paypal/return', async (req, res) => {
+    try {
+      const token = String(req.query.token || '');        // PayPal order id
+      const orderId = Number(req.query.order_id || '0');  // nostra order id
+      if (!token || !orderId) throw new Error('Paràmetres invàlids');
+
+      const capture = await paypalCaptureOrder(token);
+      const paid = (capture?.status === 'COMPLETED') || (capture?.purchase_units?.[0]?.payments?.captures?.[0]?.status === 'COMPLETED');
+
+      await db.setOrderPaymentInfo(orderId, {
+        payment_status: paid ? 'PAID' : 'UNPAID',
+        payment_id: token,
+        payment_receipt_json: capture,
+        paid_at: paid ? new Date().toISOString() : null
+      });
+
+      const o = await db.getOrderById(orderId);
+
+      try {
+        await bot.telegram.sendMessage(o.user_id, paid
+          ? `✅ Pagament rebut a PayPal. La teva comanda #${orderId} ha quedat confirmada.`
+          : `❗️ No s’ha completat el pagament. La teva comanda #${orderId} segueix pendent. Torna a /cistella per reintentar.`);
+      } catch {}
+
+      // Notifica admins NOMÉS si pagat
+      if (paid) await notifyAdminsOfOrder(o);
+
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      res.end(`
+        <html><body style="font-family: sans-serif; text-align:center; padding:40px">
+          <h2>${paid ? 'Pagament completat ✅' : 'Pagament no completat'}</h2>
+          <p>Comanda #${orderId}</p>
+          <p>Pots tornar a Telegram.</p>
+        </body></html>
+      `);
+    } catch (e) {
+      console.error('paypal/return error:', e.message);
+      res.status(500).send('Error processant el retorn de PayPal.');
+    }
+  });
+
+  app.get('/paypal/cancel', async (req, res) => {
+    const orderId = Number(req.query.order_id || '0');
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.end(`
+      <html><body style="font-family: sans-serif; text-align:center; padding:40px">
+        <h2>Pagament cancel·lat</h2>
+        <p>Comanda #${orderId || '-'}. Pots tornar a Telegram i reintentar des de la cistella.</p>
+      </body></html>
+    `);
+  });
+
+  // Webhook del bot
   app.use(bot.webhookCallback(HOOK_PATH));
   if (!APP_URL) throw new Error('Falta APP_URL per al webhook');
   await bot.telegram.setWebhook(`${APP_URL}${HOOK_PATH}`);
+
   app.get('/', (_, res) => res.send('OK'));
   app.listen(PORT, () => console.log('Listening on', PORT));
 } else {

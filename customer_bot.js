@@ -1,4 +1,4 @@
-// customer_bot.js — Cistella persistent a BD, cistella editable, perfil persistent, flux net + notificació a admins
+// customer_bot.js — Cistella persistent, notificació admins i talles per categoria
 import 'dotenv/config';
 import { Telegraf, Markup } from 'telegraf';
 import pkg from 'pg';
@@ -135,8 +135,8 @@ const db = {
 const BOT_TOKEN = process.env.CUSTOMER_BOT_TOKEN || process.env.CLIENT_BOT_TOKEN;
 if (!BOT_TOKEN) throw new Error('Falta CUSTOMER_BOT_TOKEN o CLIENT_BOT_TOKEN');
 
-// on avisos a admins des d'aquest bot (ids separats per comes)
-const ADMIN_CHAT_IDS = (process.env.ADMIN_CHAT_IDS || process.env.ADMIN_USER_ID || '').split(',').map(s => s.trim()).filter(Boolean);
+const ADMIN_CHAT_IDS = (process.env.ADMIN_CHAT_IDS || process.env.ADMIN_USER_ID || '')
+  .split(',').map(s => s.trim()).filter(Boolean);
 
 const bot = new Telegraf(BOT_TOKEN);
 const sessions = new Map();           // key: userId -> { step, cart, ... }
@@ -149,17 +149,34 @@ const enc = (s) => encodeURIComponent(s || '');
 const dec = (s) => decodeURIComponent(s || '');
 const trim = (t, n = 300) => (t || '').replace(/\s+/g, ' ').trim().slice(0, n);
 
+/* ─── Talles per categoria ─── */
+const deaccent = (s) => (s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+function sizeKindFor(p) {
+  const cat = deaccent(p.category);
+  const shoes = ['sneakers', 'zapatillas', 'sandalias', 'chanclas'];
+  const apparel = ['chandal', 'camisetas', 'chaquetas', 'banador', 'pantalones']; // "bañador" → "banador"
+  if (shoes.some(k => cat.includes(k))) return 'shoe';
+  if (apparel.some(k => cat.includes(k))) return 'apparel';
+  return 'none';
+}
+function sizeSuggestionsFor(p) {
+  const kind = sizeKindFor(p);
+  if (kind === 'shoe') return ['36','36.5','37','37.5','38','38.5','39','40','40.5','41','42','42.5','43','44','44.5','45','46'];
+  if (kind === 'apparel') return ['XS','S','M','L','XL','XXL'];
+  return null;
+}
+
 async function displayPriceCents(p) {
   if (Number(p.base_price_cents) > 0) return Number(p.base_price_cents);
   const m = await db.minPriceForProduct(p.id);
   return m > 0 ? m : 0;
 }
 
-/* ───────── Menú principal ───────── */
+/* ───────── Menú ───────── */
 bot.start((ctx) => {
   setS(ctx.from.id, {});
   ctx.reply(
-    '👋 Benvingut/da! Escriu per cercar (ex: "samba") o navega:',
+    '👋 Benvingut/da! Escriu per cercar o navega:',
     Markup.keyboard([
       ['📂 Categories', '🏷️ Marques'],
       ['🧺 Veure cistella', '👤 Dades d’enviament']
@@ -219,7 +236,7 @@ bot.action(/^(CAT|BRAND)\|(.+)\|(\d+)$/, async (ctx) => {
 });
 bot.action('NOOP', (ctx) => ctx.answerCbQuery());
 
-/* ───────── Cerca lliure (sense tallar formularis) ───────── */
+/* ───────── Cerca lliure (evita tallar formularis) ───────── */
 bot.on('text', async (ctx, next) => {
   const s = getS(ctx.from.id);
   if (['ASK_SIZE', 'ASK_SIZE_EDIT', 'ASK_NAME', 'ASK_ADDR'].includes(s.step)) return next();
@@ -234,22 +251,31 @@ bot.on('text', async (ctx, next) => {
   await ctx.reply('He trobat això. Tria un producte:', Markup.inlineKeyboard(kb));
 });
 
-/* ───────── Targeta producte + talla ───────── */
-function sizeSuggestionsFor(p) {
-  if ((p.category || '').toLowerCase().includes('roba')) return ['XS', 'S', 'M', 'L', 'XL', 'XXL'];
-  return ['36', '36.5', '37', '37.5', '38', '38.5', '39', '40', '40.5', '41', '42', '42.5', '43', '44', '44.5', '45', '46'];
-}
+/* ───────── Targeta producte ───────── */
 async function showProductCard(ctx, p) {
   const priceC = await displayPriceCents(p);
   const caption = `🧩 ${p.name}\n💶 ${priceC ? toEuro(priceC) : 'Preu a consultar'}\n\n${trim(p.description, 300)}`;
-  const buttons = [
-    [Markup.button.callback('➕ Afegir (tria talla)', `ASKSZ_${p.id}`)],
-    [Markup.button.callback('🧺 Veure cistella', 'OPEN_CART')]
-  ];
+
+  const kind = sizeKindFor(p);
+  let buttons;
+  if (kind === 'none') {
+    buttons = [
+      [Markup.button.callback('➕ Afegir', `ADD_NOPSZ_${p.id}`)],
+      [Markup.button.callback('🧺 Veure cistella', 'OPEN_CART')]
+    ];
+  } else {
+    buttons = [
+      [Markup.button.callback('➕ Afegir (tria talla)', `ASKSZ_${p.id}`)],
+      [Markup.button.callback('🧺 Veure cistella', 'OPEN_CART')]
+    ];
+  }
+
   try {
     if (p.image_url) await ctx.replyWithPhoto(p.image_url, { caption, ...Markup.inlineKeyboard(buttons) });
     else await ctx.reply(caption, Markup.inlineKeyboard(buttons));
-  } catch { await ctx.reply(caption, Markup.inlineKeyboard(buttons)); }
+  } catch {
+    await ctx.reply(caption, Markup.inlineKeyboard(buttons));
+  }
 }
 bot.action(/P_(\d+)/, async (ctx) => {
   await ctx.answerCbQuery();
@@ -258,12 +284,20 @@ bot.action(/P_(\d+)/, async (ctx) => {
   if (!p) return ctx.answerCbQuery('Producte no trobat');
   return showProductCard(ctx, p);
 });
+bot.action(/ADD_NOPSZ_(\d+)/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const pid = Number(ctx.match[1]);
+  await addToCart(ctx, pid, null, 1);
+});
 
 bot.action(/ASKSZ_(\d+)/, async (ctx) => {
   await ctx.answerCbQuery();
   const pid = Number(ctx.match[1]);
   const p = await db.getProduct(pid);
   if (!p) return;
+  if (sizeKindFor(p) === 'none') {
+    return addToCart(ctx, pid, null, 1);
+  }
   const s = getS(ctx.from.id);
   setS(ctx.from.id, { ...s, step: 'ASK_SIZE', productId: pid });
 
@@ -290,18 +324,16 @@ bot.on('text', async (ctx, next) => {
   await addToCart(ctx, s.productId, size, 1);
 });
 
-/* ───────── Cistella: helpers ───────── */
+/* ───────── Cistella ───────── */
 async function persistCart(ctx, cart) {
-  try {
-    await db.saveCart(ctx.from.id, ctx.from.username || '', cart || []);
-  } catch (e) {
-    console.error('persistCart error:', e.message);
-  }
+  try { await db.saveCart(ctx.from.id, ctx.from.username || '', cart || []); }
+  catch (e) { console.error('persistCart error:', e.message); }
 }
 function cartText(cart) {
-  const lines = (cart || []).map((it, i) =>
-    `#${i + 1} ${it.productName} — talla ${it.size} ×${it.qty} = ${toEuro((it.price_cents || 0) * (it.qty || 1))}`
-  );
+  const lines = (cart || []).map((it, i) => {
+    const labelTalla = it.size ? ` — talla ${it.size}` : '';
+    return `#${i + 1} ${it.productName}${labelTalla} ×${it.qty} = ${toEuro((it.price_cents || 0) * (it.qty || 1))}`;
+  });
   const total = (cart || []).reduce((a, it) => a + (it.price_cents || 0) * (it.qty || 1), 0);
   return { text: ['Cistella:', ...lines, `Total: ${toEuro(total)}`].join('\n'), total };
 }
@@ -313,10 +345,14 @@ function cartKeyboard(cart) {
       Markup.button.callback(`×${it.qty}`, 'NOOP'),
       Markup.button.callback(`+`, `INC_${i}`)
     ]);
-    rows.push([
-      Markup.button.callback('🔁 Talla', `EDIT_SIZE_${i}`),
-      Markup.button.callback('🗑 Eliminar', `DEL_${i}`)
-    ]);
+    if (it.size) {
+      rows.push([
+        Markup.button.callback('🔁 Talla', `EDIT_SIZE_${i}`),
+        Markup.button.callback('🗑 Eliminar', `DEL_${i}`)
+      ]);
+    } else {
+      rows.push([Markup.button.callback('🗑 Eliminar', `DEL_${i}`)]);
+    }
   });
   rows.push([Markup.button.callback('✅ Confirmar comanda', 'CHECKOUT')]);
   rows.push([Markup.button.callback('🛍️ Continuar comprant', 'CONT_SHOP'), Markup.button.callback('🧹 Buidar', 'CLEAR_CART')]);
@@ -341,7 +377,6 @@ async function renderCart(ctx, edit = false) {
 }
 async function showCart(ctx) { return renderCart(ctx, false); }
 
-/* Afegir i modificar cistella */
 async function addToCart(ctx, productId, size, qty = 1) {
   const p = await db.getProduct(productId);
   if (!p) return ctx.reply('No he pogut trobar el producte.');
@@ -353,8 +388,9 @@ async function addToCart(ctx, productId, size, qty = 1) {
   await persistCart(ctx, cart);
 
   const total = cart.reduce((a, it) => a + (it.price_cents || 0) * (it.qty || 1), 0);
+  const labelTalla = size ? ` — talla ${size}` : '';
   await ctx.reply(
-    `🛒 Afegit: ${p.name} — talla ${size} ×${qty}\nTotal: ${toEuro(total)}`,
+    `🛒 Afegit: ${p.name}${labelTalla} ×${qty}\nTotal: ${toEuro(total)}`,
     Markup.inlineKeyboard([
       [Markup.button.callback('🧺 Veure/Confirmar', 'OPEN_CART')],
       [Markup.button.callback('🛍️ Continuar comprant', 'CONT_SHOP')]
@@ -368,7 +404,6 @@ bot.action('CONT_SHOP', async (ctx) => {
     ['🧺 Veure cistella', '👤 Dades d’enviament']
   ]).resize());
 });
-
 bot.action('OPEN_CART', async (ctx) => { await ctx.answerCbQuery(); return renderCart(ctx, true); });
 bot.action(/INC_(\d+)/, async (ctx) => {
   await ctx.answerCbQuery();
@@ -403,7 +438,7 @@ bot.action(/EDIT_SIZE_(\d+)/, async (ctx) => {
   const idx = Number(ctx.match[1]);
   const s = getS(ctx.from.id); if (!s.cart?.[idx]) return;
   setS(ctx.from.id, { ...s, step: 'ASK_SIZE_EDIT', editIndex: idx });
-  return ctx.reply(`Escriu la nova talla per a «${s.cart[idx].productName}» (actual: ${s.cart[idx].size})`);
+  return ctx.reply(`Escriu la nova talla per a «${s.cart[idx].productName}» (actual: ${s.cart[idx].size || '-'})`);
 });
 bot.on('text', async (ctx, next) => {
   const s = getS(ctx.from.id);
@@ -424,8 +459,8 @@ bot.action('CLEAR_CART', async (ctx) => {
   try { await ctx.editMessageText('🧹 Cistella buidada.'); } catch { await ctx.reply('🧹 Cistella buidada.'); }
 });
 
-/* ───────── Perfil (nom + adreça) ───────── */
-async function showOrEditProfile(ctx, _fromMenu = false) {
+/* ───────── Perfil ───────── */
+async function showOrEditProfile(ctx) {
   const cust = await db.getCustomer(ctx.from.id);
   if (cust?.customer_name && cust?.address_text) {
     const msg = `👤 Dades d’enviament\nNom: ${cust.customer_name}\nAdreça:\n${cust.address_text}`;
@@ -442,7 +477,6 @@ async function showOrEditProfile(ctx, _fromMenu = false) {
 bot.action('EDIT_NAME', async (ctx) => { await ctx.answerCbQuery(); const s = getS(ctx.from.id); setS(ctx.from.id, { ...s, step: 'ASK_NAME', profileMode: true }); ctx.reply('Escriu el teu Nom i Cognoms:'); });
 bot.action('EDIT_ADDR', async (ctx) => { await ctx.answerCbQuery(); const s = getS(ctx.from.id); setS(ctx.from.id, { ...s, step: 'ASK_ADDR', profileMode: true }); ctx.reply('Escriu l’adreça completa d’enviament:'); });
 
-/* ───────── Checkout ───────── */
 bot.action('CHECKOUT', async (ctx) => {
   await ctx.answerCbQuery();
   const s = getS(ctx.from.id);
@@ -466,7 +500,6 @@ bot.action('CHECKOUT', async (ctx) => {
 bot.action('EDIT_PROFILE', async (ctx) => { await ctx.answerCbQuery(); const s = getS(ctx.from.id); setS(ctx.from.id, { ...s, step: 'ASK_NAME', profileMode: false }); ctx.reply('Escriu el teu Nom i Cognoms:'); });
 bot.action('CONFIRM_PROFILE', async (ctx) => { await ctx.answerCbQuery(); return finalizeOrder(ctx); });
 
-/* Formulari Nom/Adreça (handlers al final) */
 bot.on('text', async (ctx, next) => {
   const s = getS(ctx.from.id);
   if (s.step !== 'ASK_NAME') return next();
@@ -489,31 +522,26 @@ bot.on('text', async (ctx, next) => {
   }
 });
 
-/* Finalitzar comanda — LLEGEIX SEMPRE LA CISTELLA DE BD PRIMER i envia avís a admins */
+/* ───────── Finalitzar comanda (cistella des de BD i avís admins) ───────── */
 async function finalizeOrder(ctx) {
   const userId = ctx.from.id;
   const username = ctx.from.username || '';
 
-  // 1) Font de veritat: cistella guardada a BD
   let persisted = [];
   try { persisted = await db.loadCart(userId); } catch (e) { console.error('loadCart error:', e.message); }
 
-  // 2) Si per algun motiu està buida, usem la de memòria
   const s = getS(userId);
   let cart = Array.isArray(persisted) && persisted.length ? persisted : (s.cart || []);
   if (!cart.length) return ctx.reply('La cistella és buida.');
 
-  // 3) Dades del client
   const cust = await db.getCustomer(userId);
   if (!cust?.customer_name || !cust?.address_text) {
     setS(userId, { ...s, step: 'ASK_NAME', profileMode: false });
     return ctx.reply('Escriu el teu Nom i Cognoms:');
   }
 
-  // 4) Total robust
   const total = cart.reduce((acc, it) => (acc + (Number(it.price_cents) || 0) * (Number(it.qty) || 1)), 0);
 
-  // 5) Desa la comanda i recupera id
   const row = await db.insertOrder({
     user_id: userId,
     username,
@@ -526,15 +554,15 @@ async function finalizeOrder(ctx) {
   });
   const orderId = row?.id;
 
-  // 6) Neteja cistella (memòria + BD)
   setS(userId, { ...s, cart: [] });
   try { await db.saveCart(userId, username, []); } catch (e) { console.error('saveCart after order error:', e.message); }
 
-  // 7) Avís als ADMIN_CHAT_IDS amb el detall dels productes (sense Markdown)
+  // Avís admins
   if (ADMIN_CHAT_IDS.length) {
-    const lines = cart.map(it =>
-      `• ${it.productName} — talla ${it.size} ×${it.qty} = ${toEuro((Number(it.price_cents)||0)*(Number(it.qty)||1))}`
-    ).join('\n') || '(cap)';
+    const lines = cart.map(it => {
+      const label = it.size ? ` — talla ${it.size}` : '';
+      return `• ${it.productName}${label} ×${it.qty} = ${toEuro((Number(it.price_cents)||0)*(Number(it.qty)||1))}`;
+    }).join('\n') || '(cap)';
     const msg =
       `NOVA COMANDA #${orderId ?? '?'}\n` +
       `Client: ${cust.customer_name}\n` +
@@ -548,7 +576,6 @@ async function finalizeOrder(ctx) {
     }
   }
 
-  // 8) Confirmació al client
   try {
     await ctx.editMessageText(`✅ Comanda registrada! Import: ${toEuro(total)}. Et contactarem per pagament i enviament.`);
   } catch {

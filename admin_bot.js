@@ -29,18 +29,20 @@ const isAdmin = (ctx) => ADMIN_IDS.includes(String(ctx.from.id));
 function itemsFromRow(order) {
   const src = order?.items_json;
   if (!src) return [];
-  if (Array.isArray(src)) return src;       // jsonb deserialitzat
-  if (typeof src === 'object') return src;  // jsonb objecte
-  try { return JSON.parse(src); } catch { return []; } // text -> json
+  if (Array.isArray(src)) return src;
+  if (typeof src === 'object') return src;
+  try { return JSON.parse(src); } catch { return []; }
 }
 
 function formatOrderMessage(o) {
   const items = itemsFromRow(o);
-  const lines = items.map(it => {
+  const line = (it) => {
     const p = Number(it.price_cents) || 0;
     const q = Number(it.qty) || 1;
-    return `• ${it.productName} — talla ${it.size} ×${q} = ${toEuro(p * q)}`;
-  });
+    const talla = it.size ? ` — talla ${it.size}` : '';
+    return `• ${it.productName}${talla} ×${q} = ${toEuro(p * q)}`;
+  };
+  const lines = items.map(line);
   const itemsBlock = lines.length ? lines.join('\n') : '(buit)';
 
   const userStr = o.username ? `@${o.username}` : String(o.user_id);
@@ -74,7 +76,7 @@ function keyboardForOrder(o) {
   }
 }
 
-/* ───────── Watcher de comandes noves ───────── */
+/* ───────── Watcher ───────── */
 async function watchNewOrders() {
   try {
     const res = await pool.query(
@@ -88,15 +90,10 @@ async function watchNewOrders() {
     for (const o of res.rows) {
       const msg = formatOrderMessage(o);
       const kb = keyboardForOrder(o);
-
       for (const adminId of ADMIN_IDS) {
-        try {
-          await bot.telegram.sendMessage(adminId, msg, { ...kb, disable_web_page_preview: true });
-        } catch (e) {
-          console.error('Send fail to', adminId, e.message);
-        }
+        try { await bot.telegram.sendMessage(adminId, msg, { ...kb, disable_web_page_preview: true }); }
+        catch (e) { console.error('Send fail to', adminId, e.message); }
       }
-
       try { await pool.query('UPDATE orders SET notified_at = now() WHERE id = $1', [o.id]); }
       catch (e) { console.error('Mark notified error for', o.id, e.message); }
     }
@@ -105,7 +102,7 @@ async function watchNewOrders() {
   }
 }
 
-/* ───────── Accions inline: canviar estat ───────── */
+/* ───────── Accions ───────── */
 async function loadOrder(id) {
   const r = await pool.query(
     `SELECT id, user_id, username, items_json, total_cents, customer_name, address_text, status, created_at
@@ -113,7 +110,6 @@ async function loadOrder(id) {
   );
   return r.rows[0];
 }
-
 bot.action(/^ORDER_DONE_(\d+)$/, async (ctx) => {
   if (!isAdmin(ctx)) return ctx.answerCbQuery('No autoritzat');
   const id = Number(ctx.match[1]);
@@ -125,7 +121,6 @@ bot.action(/^ORDER_DONE_(\d+)$/, async (ctx) => {
   catch { await ctx.reply(msg, { ...kb, disable_web_page_preview: true }); }
   await ctx.answerCbQuery('Comanda marcada com a realitzada');
 });
-
 bot.action(/^ORDER_PENDING_(\d+)$/, async (ctx) => {
   if (!isAdmin(ctx)) return ctx.answerCbQuery('No autoritzat');
   const id = Number(ctx.match[1]);
@@ -145,8 +140,7 @@ bot.start((ctx) => {
     ['📦 Llistar comandes']
   ]).resize());
 });
-
-async function sendLatestOrders(ctx, limit = 10) {
+async function sendLatestOrders(ctx, limit = 15) {
   const r = await pool.query(
     `SELECT id, user_id, username, items_json, total_cents, customer_name, address_text, status, created_at
        FROM orders ORDER BY id DESC LIMIT $1`, [limit]
@@ -158,21 +152,13 @@ async function sendLatestOrders(ctx, limit = 10) {
     await ctx.reply(msg, { ...kb, disable_web_page_preview: true });
   }
 }
+bot.hears('📦 Llistar comandes', async (ctx) => { if (!isAdmin(ctx)) return; return sendLatestOrders(ctx, 15); });
+bot.command('orders', async (ctx) => { if (!isAdmin(ctx)) return; return sendLatestOrders(ctx, 15); });
 
-bot.hears('📦 Llistar comandes', async (ctx) => {
-  if (!isAdmin(ctx)) return;
-  return sendLatestOrders(ctx, 15);
-});
-
-bot.command('orders', async (ctx) => {
-  if (!isAdmin(ctx)) return;
-  return sendLatestOrders(ctx, 15);
-});
-
-/* ───────── Infra (webhook / polling) ───────── */
+/* ───────── Infra ───────── */
 const USE_WEBHOOK = String(process.env.USE_WEBHOOK).toLowerCase() === 'true';
 const PORT = Number(process.env.PORT || 3000);
-const APP_URL = process.env.APP_URL;              // ex: https://<subdomini-admin>.up.railway.app
+const APP_URL = process.env.APP_URL;
 const HOOK_PATH = process.env.HOOK_PATH || '/tghook';
 
 if (USE_WEBHOOK) {
@@ -190,5 +176,5 @@ if (USE_WEBHOOK) {
 process.once('SIGINT', () => { try { bot.stop('SIGINT'); } catch {} });
 process.once('SIGTERM', () => { try { bot.stop('SIGTERM'); } catch {} });
 
-/* ───────── Loop del watcher ───────── */
-setInterval(watchNewOrders, 7000); // comprova noves comandes cada 7s
+/* ───────── Watch loop ───────── */
+setInterval(watchNewOrders, 7000);

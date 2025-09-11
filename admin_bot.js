@@ -1,4 +1,4 @@
-// admin_bot.js — Notificacions + llistat + canvi d'estat de comandes
+// admin_bot.js — Notifica només comandes PAGADES + llistat + canvi d'estat
 import 'dotenv/config';
 import { Telegraf, Markup } from 'telegraf';
 import pkg from 'pg';
@@ -15,7 +15,7 @@ const ADMIN_IDS = (process.env.ADMIN_IDS || process.env.ADMIN_USER_ID || '')
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: process.env.PGSSLMODE === 'require' ? { rejectUnauthorized: false } : false
+  ssl: process.env.PGSSLMODE === 'require' ? ({ rejectUnauthorized: false }) : false
 });
 
 const bot = new Telegraf(ADMIN_BOT_TOKEN);
@@ -49,8 +49,8 @@ function formatOrderMessage(o) {
   const created = o.created_at ? new Date(o.created_at).toLocaleString('es-ES') : '';
 
   return [
-    `🆕 NOVA COMANDA #${o.id}`,
-    `Estat: ${o.status || 'PENDING'}`,
+    `🆕 COMANDA #${o.id}`,
+    `Estat: ${o.status || 'PENDING'} — Pagament: ${o.payment_status || 'UNPAID'}`,
     `Client: ${o.customer_name || '-'}`,
     `Usuari: ${userStr}`,
     `Adreça:`,
@@ -76,13 +76,15 @@ function keyboardForOrder(o) {
   }
 }
 
-/* ───────── Watcher ───────── */
-async function watchNewOrders() {
+/* ───────── Watcher: NOMÉS quan payment_status='PAID' ───────── */
+async function watchNewPaidOrders() {
   try {
     const res = await pool.query(
-      `SELECT id, user_id, username, items_json, total_cents, customer_name, address_text, status, created_at
+      `SELECT id, user_id, username, items_json, total_cents,
+              customer_name, address_text, status, created_at, payment_status
          FROM orders
         WHERE notified_at IS NULL
+          AND payment_status = 'PAID'
         ORDER BY id ASC
         LIMIT 20`
     );
@@ -98,14 +100,14 @@ async function watchNewOrders() {
       catch (e) { console.error('Mark notified error for', o.id, e.message); }
     }
   } catch (e) {
-    console.error('watchNewOrders error:', e.message);
+    console.error('watchNewPaidOrders error:', e.message);
   }
 }
 
 /* ───────── Accions ───────── */
 async function loadOrder(id) {
   const r = await pool.query(
-    `SELECT id, user_id, username, items_json, total_cents, customer_name, address_text, status, created_at
+    `SELECT id, user_id, username, items_json, total_cents, customer_name, address_text, status, created_at, payment_status
        FROM orders WHERE id=$1`, [id]
   );
   return r.rows[0];
@@ -142,7 +144,8 @@ bot.start((ctx) => {
 });
 async function sendLatestOrders(ctx, limit = 15) {
   const r = await pool.query(
-    `SELECT id, user_id, username, items_json, total_cents, customer_name, address_text, status, created_at
+    `SELECT id, user_id, username, items_json, total_cents,
+            customer_name, address_text, status, created_at, payment_status
        FROM orders ORDER BY id DESC LIMIT $1`, [limit]
   );
   if (!r.rows.length) return ctx.reply('Sense comandes.');
@@ -177,4 +180,4 @@ process.once('SIGINT', () => { try { bot.stop('SIGINT'); } catch {} });
 process.once('SIGTERM', () => { try { bot.stop('SIGTERM'); } catch {} });
 
 /* ───────── Watch loop ───────── */
-setInterval(watchNewOrders, 7000);
+setInterval(watchNewPaidOrders, 7000);

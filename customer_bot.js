@@ -1,4 +1,4 @@
-// customer_bot.js — Cistella, talles per categoria, pagament PayPal, perfil arreglat
+// customer_bot.js — Cistella, talles per categoria, pagament PayPal, perfil
 import 'dotenv/config';
 import { Telegraf, Markup } from 'telegraf';
 import pkg from 'pg';
@@ -171,6 +171,7 @@ const toEuro = (c) => (Number(c || 0) / 100).toLocaleString('es-ES', { style: 'c
 const PAGE = 10;
 const enc = (s) => encodeURIComponent(s || '');
 const dec = (s) => decodeURIComponent(s || '');
+// ÚNICA definició de trim
 const trim = (t, n = 300) => (t || '').replace(/\s+/g, ' ').trim().slice(0, n);
 
 /* ─── Talles per categoria ─── */
@@ -252,7 +253,6 @@ bot.action(/^(CAT|BRAND)\|(.+)\|(\d+)$/, async (ctx) => {
 bot.action('NOOP', (ctx) => ctx.answerCbQuery());
 
 /* ───────── Targeta producte ───────── */
-function trim(t, n = 300) { return (t || '').replace(/\s+/g, ' ').trim().slice(0, n); }
 async function showProductCard(ctx, p) {
   const priceC = await displayPriceCents(p);
   const caption = `🧩 ${p.name}\n💶 ${priceC ? toEuro(priceC) : 'Preu a consultar'}\n\n${trim(p.description, 300)}`;

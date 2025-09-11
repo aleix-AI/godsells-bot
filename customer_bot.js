@@ -8,6 +8,7 @@ const { Pool } = pkg;
 const PAYPAL_MODE = (process.env.PAYPAL_MODE || 'sandbox').toLowerCase(); // 'sandbox' | 'live'
 const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID || '';
 const PAYPAL_SECRET = process.env.PAYPAL_SECRET || '';
+const PAYPAL_WEBHOOK_ID = process.env.PAYPAL_WEBHOOK_ID || '';
 const PAYPAL_API_BASE = PAYPAL_MODE === 'live'
   ? 'https://api-m.paypal.com'
   : 'https://api-m.sandbox.paypal.com';
@@ -680,6 +681,109 @@ if (USE_WEBHOOK) {
     `);
   });
 
+  // Verificació + processament de webhooks PayPal
+const expressJsonForPaypal = (await import('express')).default.json({
+  verify: (req, _res, buf) => { req.rawBody = buf.toString('utf8'); }
+});
+
+app.post('/paypal/webhook', expressJsonForPaypal, async (req, res) => {
+  try {
+    // 1) Verificar signatura
+    const hdr = {
+      'transmission_id': req.header('paypal-transmission-id'),
+      'transmission_time': req.header('paypal-transmission-time'),
+      'transmission_sig': req.header('paypal-transmission-sig'),
+      'cert_url': req.header('paypal-cert-url'),
+      'auth_algo': req.header('paypal-auth-algo')
+    };
+    const event = req.body;
+
+    if (!PAYPAL_WEBHOOK_ID) throw new Error('Falta PAYPAL_WEBHOOK_ID');
+    const access = await paypalAccessToken();
+    const vr = await fetch(`${PAYPAL_API_BASE}/v1/notifications/verify-webhook-signature`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${access}` },
+      body: JSON.stringify({
+        auth_algo: hdr.auth_algo,
+        cert_url: hdr.cert_url,
+        transmission_id: hdr.transmission_id,
+        transmission_sig: hdr.transmission_sig,
+        transmission_time: hdr.transmission_time,
+        webhook_id: PAYPAL_WEBHOOK_ID,
+        webhook_event: event
+      })
+    }).then(r => r.json());
+
+    if (vr?.verification_status !== 'SUCCESS') {
+      console.warn('PayPal webhook: verificació fallida', vr);
+      return res.status(400).send('invalid');
+    }
+
+    // 2) Gestionar esdeveniments
+    const type = event.event_type;
+    // Helpers per trobar comanda nostra a partir de l’orderId PayPal
+    async function findOurOrderByPayPalOrderId(ppOrderId) {
+      return (await pool.query(`SELECT * FROM orders WHERE payment_id=$1 ORDER BY id DESC LIMIT 1`, [ppOrderId])).rows[0];
+    }
+
+    if (type === 'CHECKOUT.ORDER.APPROVED') {
+      // L’usuari ha aprovat a PayPal però potser no ha tornat al bot → capturem nosaltres
+      const ppOrderId = event.resource?.id;
+      if (ppOrderId) {
+        const our = await findOurOrderByPayPalOrderId(ppOrderId);
+        if (our && our.payment_status !== 'PAID') {
+          const cap = await paypalCaptureOrder(ppOrderId);
+          const paid = (cap?.status === 'COMPLETED') ||
+                       (cap?.purchase_units?.[0]?.payments?.captures?.[0]?.status === 'COMPLETED');
+          await db.setOrderPaymentInfo(our.id, {
+            payment_status: paid ? 'PAID' : 'UNPAID',
+            payment_id: ppOrderId,
+            payment_receipt_json: cap,
+            paid_at: paid ? new Date().toISOString() : null
+          });
+          const updated = await db.getOrderById(our.id);
+          // Notificar admins una sola vegada
+          if (paid && !updated.notified_at) {
+            await notifyAdminsOfOrder(updated);
+            await db.setOrderPaymentInfo(updated.id, { notified_at: new Date().toISOString() });
+          }
+        }
+      }
+    }
+
+    if (type === 'PAYMENT.CAPTURE.COMPLETED') {
+      // Pagament capturat: marquem com pagat si cal i notifiquem
+      const capture = event.resource;
+      const ppOrderId =
+        capture?.supplementary_data?.related_ids?.order_id
+        || (capture?.links || []).find(l => l.rel === 'up')?.href?.split('/')?.pop();
+
+      if (ppOrderId) {
+        const our = await findOurOrderByPayPalOrderId(ppOrderId);
+        if (our && our.payment_status !== 'PAID') {
+          await db.setOrderPaymentInfo(our.id, {
+            payment_status: 'PAID',
+            payment_id: ppOrderId,
+            // Guardem l’últim event per traça
+            payment_receipt_json: capture,
+            paid_at: new Date().toISOString()
+          });
+          const updated = await db.getOrderById(our.id);
+          if (!updated.notified_at) {
+            await notifyAdminsOfOrder(updated);
+            await db.setOrderPaymentInfo(updated.id, { notified_at: new Date().toISOString() });
+          }
+        }
+      }
+    }
+
+    res.send('OK');
+  } catch (e) {
+    console.error('paypal/webhook error:', e.message);
+    res.status(200).send('OK'); // Respondre 200 sempre per evitar reintents infinits; loguegem errors
+  }
+});
+
   app.use(bot.webhookCallback(HOOK_PATH));
   if (!APP_URL) throw new Error('Falta APP_URL per al webhook');
   await bot.telegram.setWebhook(`${APP_URL}${HOOK_PATH}`);
@@ -713,3 +817,4 @@ bot.on('text', async (ctx) => {
 
 process.once('SIGINT', () => { try { bot.stop('SIGINT'); } catch {} });
 process.once('SIGTERM', () => { try { bot.stop('SIGTERM'); } catch {} });
+

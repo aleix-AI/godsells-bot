@@ -1,4 +1,4 @@
-// admin_bot.js — Llistat, estat, reemborsaments i AVÍS de comandes pendents
+// admin_bot.js — Comandes, reemborsaments, avisos pendents + PETICIONS de producte
 import 'dotenv/config';
 import { Telegraf, Markup } from 'telegraf';
 import pkg from 'pg';
@@ -28,12 +28,31 @@ const admin = new Telegraf(ADMIN_BOT_TOKEN);
 const isAdmin = (ctx) => ADMIN_IDS.includes(String(ctx.from.id));
 const toEuro = (c) => (Number(c || 0) / 100).toLocaleString('es-ES', { style: 'currency', currency: 'EUR' });
 
-/* ───────── DB bootstrap (migració suau) ───────── */
+/* ───────── DB bootstrap (migracions suaus) ───────── */
 async function ensureColumns() {
+  // Columns per avisos de comandes pendents
   await pool.query(`
     ALTER TABLE orders
       ADD COLUMN IF NOT EXISTS overdue_alerted_at timestamptz,
       ADD COLUMN IF NOT EXISTS overdue_snooze_until timestamptz
+  `).catch(()=>{});
+
+  // Taula de peticions de producte (si no existeix) + columna de notificació
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS product_requests (
+      id SERIAL PRIMARY KEY,
+      user_id BIGINT,
+      username TEXT,
+      desired_name TEXT NOT NULL,
+      desired_size TEXT,
+      notes TEXT,
+      status TEXT DEFAULT 'NEW',  -- NEW | APPROVED | REJECTED | DONE
+      created_at TIMESTAMPTZ DEFAULT now()
+    );
+  `);
+  await pool.query(`
+    ALTER TABLE product_requests
+      ADD COLUMN IF NOT EXISTS notified_at timestamptz
   `).catch(()=>{});
 }
 await ensureColumns();
@@ -96,6 +115,16 @@ const db = {
   snoozeOverdue: (id, minutes) =>
     pool.query(`UPDATE orders SET overdue_snooze_until = now() + ($2 || ' minutes')::interval WHERE id=$1`,
       [id, String(minutes)]),
+
+  // Product requests
+  listRequests: async (status = 'NEW', limit = 20) =>
+    (await pool.query(`SELECT * FROM product_requests WHERE status=$1 ORDER BY id DESC LIMIT $2`, [status, limit])).rows,
+
+  setRequestStatus: (id, status) =>
+    pool.query(`UPDATE product_requests SET status=$2 WHERE id=$1`, [id, status]),
+
+  getRequest: async (id) =>
+    (await pool.query(`SELECT * FROM product_requests WHERE id=$1`, [id])).rows[0],
 };
 
 /* ───────── Format helpers ───────── */
@@ -107,22 +136,6 @@ function formatItems(items_json) {
       `• ${it.productName || it.name} — talla ${it.size_label || it.size || '-'} ×${it.qty || 1} = ${toEuro((it.price_cents||0)*(it.qty||1))}`
     ).join('\n');
   } catch { return '(buit)'; }
-}
-
-function orderHeader(o) {
-  const when = new Date(o.created_at).toLocaleString('es-ES');
-  return [
-    `NOVA COMANDA #${o.id}`,
-    `Client: ${o.customer_name || '-'}`,
-    `Usuari: ${o.username ? '@'+o.username : (o.user_id || '-')}`,
-    `Adreça:\n${o.address_text || '-'}`,
-    ``,
-    `Productes:`,
-    formatItems(o.items_json),
-    ``,
-    `Total: ${toEuro(o.total_cents)}`,
-    `${when}`
-  ].join('\n');
 }
 
 function orderLine(o) {
@@ -144,10 +157,38 @@ function overdueButtons(o) {
   ]);
 }
 
+/* ───────── Peticions: format + botons ───────── */
+function reqButtonsInline(r) {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('✅ Acceptar', `REQ_ACCEPT_${r.id}`), Markup.button.callback('❌ Rebutjar', `REQ_REJECT_${r.id}`)],
+    [Markup.button.callback('✔️ Fet', `REQ_DONE_${r.id}`)]
+  ]);
+}
+function formatReqShort(r) {
+  return [
+    `📥 Nova petició (#${r.id})`,
+    `Usuari: ${r.username ? '@'+r.username : r.user_id}`,
+    `Nom: ${r.desired_name}`,
+    `Talla: ${r.desired_size || '-'}`,
+    r.notes ? `Notes: ${r.notes}` : ''
+  ].filter(Boolean).join('\n');
+}
+function formatReq(r) {
+  return [
+    `#${r.id} — ${new Date(r.created_at).toLocaleString('es-ES')} — ${r.status}`,
+    `Usuari: ${r.username ? '@'+r.username : r.user_id}`,
+    `Nom: ${r.desired_name}`,
+    `Talla: ${r.desired_size || '-'}`,
+    `Notes: ${r.notes || '-'}`
+  ].join('\n');
+}
+
 /* ───────── Bot UI ───────── */
 admin.start((ctx) => {
   if (!isAdmin(ctx)) return ctx.reply('No autoritzat.');
-  ctx.reply('🛠️ Admin', Markup.keyboard([['📦 Llistar comandes']]).resize());
+  ctx.reply('🛠️ Admin', Markup.keyboard([
+    ['📦 Llistar comandes', '📥 Peticions']
+  ]).resize());
 });
 
 admin.hears('📦 Llistar comandes', async (ctx) => {
@@ -157,6 +198,14 @@ admin.hears('📦 Llistar comandes', async (ctx) => {
   for (const o of rows) await ctx.reply(orderLine(o), orderButtons(o));
 });
 
+admin.hears('📥 Peticions', async (ctx) => {
+  if (!isAdmin(ctx)) return;
+  const rows = await db.listRequests('NEW', 30);
+  if (!rows.length) return ctx.reply('Sense peticions noves.');
+  for (const r of rows) await ctx.reply(formatReq(r), reqButtonsInline(r));
+});
+
+/* ───────── Accions de comandes ───────── */
 admin.action(/ORDER_DONE_(\d+)/, async (ctx) => {
   if (!isAdmin(ctx)) return ctx.answerCbQuery('No autoritzat');
   const id = Number(ctx.match[1]);
@@ -202,18 +251,41 @@ admin.action(/ORDER_REFUND_CONFIRM_(\d+)/, async (ctx) => {
   }
 });
 
-admin.action(/OVERDUE_SNOOZE_(\d+)_(\d+)/, async (ctx) => {
+/* ───────── Accions de peticions ───────── */
+admin.action(/REQ_ACCEPT_(\d+)/, async (ctx) => {
   if (!isAdmin(ctx)) return ctx.answerCbQuery('No autoritzat');
   const id = Number(ctx.match[1]);
-  const minutes = Number(ctx.match[2]);
-  await db.snoozeOverdue(id, minutes);
-  await ctx.answerCbQuery(`Snooze ${minutes} min`);
-  await ctx.reply(`Snoozed comanda #${id} durant ${minutes} minuts.`);
+  await db.setRequestStatus(id, 'APPROVED');
+  const r = await db.getRequest(id);
+  await ctx.answerCbQuery('Acceptada');
+  try { await ctx.editMessageText(formatReq(r), reqButtonsInline(r)); } catch {}
+  // (Opcional) avisar l'usuari: descomenta si vols
+  // try { await admin.telegram.sendMessage(r.user_id, `👌 Hem acceptat la teva petició per «${r.desired_name}».`); } catch {}
+});
+
+admin.action(/REQ_REJECT_(\d+)/, async (ctx) => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery('No autoritzat');
+  const id = Number(ctx.match[1]);
+  await db.setRequestStatus(id, 'REJECTED');
+  const r = await db.getRequest(id);
+  await ctx.answerCbQuery('Rebutjada');
+  try { await ctx.editMessageText(formatReq(r), reqButtonsInline(r)); } catch {}
+  // try { await admin.telegram.sendMessage(r.user_id, `Ho sentim, ara mateix no podem aconseguir «${r.desired_name}».`); } catch {}
+});
+
+admin.action(/REQ_DONE_(\d+)/, async (ctx) => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery('No autoritzat');
+  const id = Number(ctx.match[1]);
+  await db.setRequestStatus(id, 'DONE');
+  const r = await db.getRequest(id);
+  await ctx.answerCbQuery('Marcada com feta');
+  try { await ctx.editMessageText(formatReq(r), reqButtonsInline(r)); } catch {}
+  // try { await admin.telegram.sendMessage(r.user_id, `✅ La teva petició «${r.desired_name}» s’ha completat.`); } catch {}
 });
 
 admin.action('NOOP', (ctx) => ctx.answerCbQuery());
 
-/* ───────── Scheduler: avisos de pendents ───────── */
+/* ───────── Scheduler: avisos de comandes pendents ───────── */
 async function sendOverdueMessage(o) {
   const hours = Math.floor((Date.now() - new Date(o.created_at).getTime()) / 3600000);
   const msg = [
@@ -232,8 +304,7 @@ async function sendOverdueMessage(o) {
   for (const chatId of ADMIN_IDS) {
     try {
       await admin.telegram.sendMessage(chatId, msg, { parse_mode: 'Markdown', reply_markup: overdueButtons(o).reply_markup });
-    } catch (e) {
-      // Si falla Markdown per caràcters, reenviem sense parse_mode
+    } catch {
       await admin.telegram.sendMessage(chatId, msg, { reply_markup: overdueButtons(o).reply_markup }).catch(()=>{});
     }
   }
@@ -263,6 +334,32 @@ async function checkOverdue() {
 }
 setInterval(checkOverdue, Math.max(1, OVERDUE_POLL_MIN) * 60 * 1000);
 checkOverdue();
+
+/* ───────── Notificador de PETICIONS noves ───────── */
+async function checkNewRequests() {
+  try {
+    const q = await pool.query(`
+      SELECT * FROM product_requests
+      WHERE status='NEW' AND notified_at IS NULL
+      ORDER BY id ASC
+      LIMIT 20
+    `);
+    for (const r of q.rows) {
+      for (const chatId of ADMIN_IDS) {
+        try {
+          await admin.telegram.sendMessage(chatId, formatReqShort(r), { reply_markup: reqButtonsInline(r).reply_markup });
+        } catch (e) {
+          console.error('send req notify fail:', e.message);
+        }
+      }
+      await pool.query(`UPDATE product_requests SET notified_at=now() WHERE id=$1`, [r.id]);
+    }
+  } catch (e) {
+    console.error('checkNewRequests error:', e.message);
+  }
+}
+setInterval(checkNewRequests, 30 * 1000);
+checkNewRequests();
 
 /* ───────── Launch ───────── */
 admin.catch((err, ctx) => { console.error('Admin bot error', err); try { ctx.reply('Error.'); } catch {} });

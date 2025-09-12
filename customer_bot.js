@@ -1,11 +1,11 @@
-// customer_bot.js — Cistella, talles per categoria, pagament PayPal, perfil
+// customer_bot.js — Cistella, talles per categoria, PayPal (LIVE o sandbox), perfil i peticions de producte
 import 'dotenv/config';
 import { Telegraf, Markup } from 'telegraf';
 import pkg from 'pg';
 const { Pool } = pkg;
 
 /* ───────── Config PayPal ───────── */
-const PAYPAL_MODE = (process.env.PAYPAL_MODE || 'sandbox').toLowerCase(); // 'sandbox' | 'live'
+const PAYPAL_MODE = (process.env.PAYPAL_MODE || 'live').toLowerCase(); // 'sandbox' | 'live'
 const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID || '';
 const PAYPAL_SECRET = process.env.PAYPAL_SECRET || '';
 const PAYPAL_WEBHOOK_ID = process.env.PAYPAL_WEBHOOK_ID || '';
@@ -20,23 +20,28 @@ const pool = new Pool({
 });
 
 async function ensureSchema() {
-  await pool.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS brand TEXT;`);
-  await pool.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS category TEXT;`);
-  await pool.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS image_url TEXT;`);
-  await pool.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS base_price_cents INT;`);
+  // Products
+  await pool.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS brand TEXT;`).catch(()=>{});
+  await pool.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS category TEXT;`).catch(()=>{});
+  await pool.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS image_url TEXT;`).catch(()=>{});
+  await pool.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS base_price_cents INT;`).catch(()=>{});
+  await pool.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS tags JSONB DEFAULT '[]'::jsonb;`).catch(()=>{});
+  await pool.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'import';`).catch(()=>{});
 
-  await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS total_cost_cents INT DEFAULT 0;`);
-  await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS customer_name TEXT;`);
-  await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS address_text TEXT;`);
-  await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'PENDING';`);
-  await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT now();`);
-  await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS notified_at TIMESTAMPTZ;`);
-  await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_provider TEXT;`);
-  await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'UNPAID';`);
-  await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_id TEXT;`);
-  await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_receipt_json JSONB;`);
-  await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS paid_at TIMESTAMPTZ;`);
+  // Orders
+  await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS total_cost_cents INT DEFAULT 0;`).catch(()=>{});
+  await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS customer_name TEXT;`).catch(()=>{});
+  await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS address_text TEXT;`).catch(()=>{});
+  await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'PENDING';`).catch(()=>{});
+  await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT now();`).catch(()=>{});
+  await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS notified_at TIMESTAMPTZ;`).catch(()=>{});
+  await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_provider TEXT;`).catch(()=>{});
+  await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'UNPAID';`).catch(()=>{});
+  await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_id TEXT;`).catch(()=>{});
+  await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_receipt_json JSONB;`).catch(()=>{});
+  await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS paid_at TIMESTAMPTZ;`).catch(()=>{});
 
+  // Queries
   await pool.query(`
     CREATE TABLE IF NOT EXISTS queries(
       id BIGSERIAL PRIMARY KEY,
@@ -47,6 +52,7 @@ async function ensureSchema() {
     );
   `);
 
+  // Customers (perfil + darrera cistella)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS customers(
       user_id BIGINT PRIMARY KEY,
@@ -55,6 +61,20 @@ async function ensureSchema() {
       address_text  TEXT,
       updated_at TIMESTAMPTZ DEFAULT now(),
       last_cart_json JSONB DEFAULT '[]'::jsonb
+    );
+  `);
+
+  // Product requests (peticions quan no es troba el producte)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS product_requests (
+      id SERIAL PRIMARY KEY,
+      user_id BIGINT,
+      username TEXT,
+      desired_name TEXT NOT NULL,
+      desired_size TEXT,
+      notes TEXT,
+      status TEXT DEFAULT 'NEW', -- NEW | APPROVED | REJECTED | DONE
+      created_at TIMESTAMPTZ DEFAULT now()
     );
   `);
 }
@@ -169,10 +189,9 @@ const getS = (id) => sessions.get(id) || {};
 const setS = (id, s) => sessions.set(id, s);
 
 const toEuro = (c) => (Number(c || 0) / 100).toLocaleString('es-ES', { style: 'currency', currency: 'EUR' });
-const PAGE = 10;
+const PAGE_SIZE = 10;
 const enc = (s) => encodeURIComponent(s || '');
 const dec = (s) => decodeURIComponent(s || '');
-// ÚNICA definició de trim
 const trim = (t, n = 300) => (t || '').replace(/\s+/g, ' ').trim().slice(0, n);
 
 /* ─── Talles per categoria ─── */
@@ -180,9 +199,9 @@ const deaccent = (s) => (s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '
 function sizeKindFor(p) {
   const cat = deaccent(p.category);
   const shoes = ['sneakers', 'zapatillas', 'sandalias', 'chanclas'];
-  const apparel = ['chandal', 'camisetas', 'chaquetas', 'banador', 'pantalones'];
-  if (shoes.some(k => cat.includes(k))) return 'shoe';
-  if (apparel.some(k => cat.includes(k))) return 'apparel';
+  const apparel = ['chandal', 'camisetas', 'chaquetas', 'banador', 'pantalones', 'camiseta', 'chaqueta', 'pantalon'];
+  if (shoes.some(k => cat?.includes(k))) return 'shoe';
+  if (apparel.some(k => cat?.includes(k))) return 'apparel';
   return 'none';
 }
 function sizeSuggestionsFor(p) {
@@ -228,7 +247,6 @@ bot.hears([/🏷️\s*Marques/i, /^(\p{Emoji_Presentation}?\s*)?marques$/iu], as
 });
 
 /* Llistats amb paginació */
-const PAGE_SIZE = 10;
 async function renderList(ctx, mode, value, page) {
   const offset = page * PAGE_SIZE;
   let total = 0, rows = [];
@@ -403,7 +421,7 @@ bot.action(/DEC_(\d+)/, async (ctx) => { await ctx.answerCbQuery(); const idx = 
 bot.action(/DEL_(\d+)/, async (ctx) => { await ctx.answerCbQuery(); const idx = +ctx.match[1]; const s = getS(ctx.from.id); if (!s.cart?.[idx]) return; s.cart.splice(idx, 1); setS(ctx.from.id, s); await persistCart(ctx, s.cart); return renderCart(ctx, true); });
 bot.action(/EDIT_SIZE_(\d+)/, async (ctx) => { await ctx.answerCbQuery(); const idx = +ctx.match[1]; const s = getS(ctx.from.id); if (!s.cart?.[idx]) return; setS(ctx.from.id, { ...s, step: 'ASK_SIZE_EDIT', editIndex: idx }); return ctx.reply(`Escriu la nova talla per a «${s.cart[idx].productName}» (actual: ${s.cart[idx].size || '-'})`); });
 
-/* ───────── Formularis (talla manual, nom, adreça) ───────── */
+/* ───────── Formularis (talla manual, edició talla, nom, adreça) ───────── */
 bot.on('text', async (ctx, next) => { // talla manual (després d'ASKSZ)
   const s = getS(ctx.from.id);
   if (s.step !== 'ASK_SIZE') return next();
@@ -422,6 +440,8 @@ bot.on('text', async (ctx, next) => { // editar talla a cistella
   await persistCart(ctx, s.cart);
   return renderCart(ctx, false);
 });
+
+/* ───────── Perfil (nom/adreça) ───────── */
 bot.hears([/👤\s*Dades d.?enviament/i, /^(\p{Emoji_Presentation}?\s*)?dades\s+d[’']?enviament$/iu], (ctx) => showOrEditProfile(ctx));
 async function showOrEditProfile(ctx) {
   const cust = await db.getCustomer(ctx.from.id);
@@ -617,6 +637,53 @@ async function finalizeOrder(ctx) {
   }
 }
 
+/* ───────── Flux "Demanar producte" quan no hi ha resultats ───────── */
+bot.action(/^REQ\|(.+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const name = decodeURIComponent(ctx.match[1] || '').slice(0, 120);
+  if (!name) return ctx.reply('Nom invàlid.');
+  const s = getS(ctx.from.id);
+  setS(ctx.from.id, { ...s, step: 'REQ_SIZE', req: { name } });
+  await ctx.reply(`Quina talla/mida vols per «${name}»?\nEx.: 42.5 o M (si tant és, escriu "Qualsevol").`);
+});
+bot.on('text', async (ctx, next) => {
+  const s = getS(ctx.from.id);
+  if (s.step !== 'REQ_SIZE') return next();
+  const size = (ctx.message.text || '').trim().slice(0, 40) || 'Qualsevol';
+  setS(ctx.from.id, { ...s, step: 'REQ_NOTES', req: { ...(s.req||{}), size } });
+  return ctx.reply('Vols afegir notes (color, pressupost, urgència…)? Si no, escriu "No".');
+});
+bot.on('text', async (ctx, next) => {
+  const s = getS(ctx.from.id);
+  if (s.step !== 'REQ_NOTES') return next();
+  const notesRaw = (ctx.message.text || '').trim();
+  const notes = /^no$/i.test(notesRaw) ? '' : notesRaw.slice(0, 300);
+  const req = s.req || {};
+  try {
+    await pool.query(
+      `INSERT INTO product_requests (user_id, username, desired_name, desired_size, notes)
+       VALUES ($1,$2,$3,$4,$5)`,
+      [ctx.from.id, ctx.from.username || '', req.name || '-', req.size || '', notes]
+    );
+  } catch (e) {
+    console.error('insert product_request error:', e.message);
+  }
+
+  // Avisa admins
+  const text =
+    `📥 *Nova petició de producte*\n` +
+    `Usuari: ${ctx.from.username ? '@'+ctx.from.username : ctx.from.id}\n` +
+    `Nom: ${req.name}\n` +
+    `Talla: ${req.size || '-'}\n` +
+    (notes ? `Notes: ${notes}\n` : '');
+  for (const chatId of ADMIN_CHAT_IDS) {
+    try { await bot.telegram.sendMessage(chatId, text, { parse_mode: 'Markdown' }); } catch {}
+  }
+
+  setS(ctx.from.id, { ...s, step: null, req: null });
+  return ctx.reply('Gràcies! Ho buscarem i et direm alguna cosa tan aviat com puguem. 🙌');
+});
+
 /* ───────── Infra (webhook + rutes PayPal) ───────── */
 const USE_WEBHOOK = String(process.env.USE_WEBHOOK).toLowerCase() === 'true';
 const PORT = Number(process.env.PORT || 3000);
@@ -681,108 +748,104 @@ if (USE_WEBHOOK) {
     `);
   });
 
-  // Verificació + processament de webhooks PayPal
-const expressJsonForPaypal = (await import('express')).default.json({
-  verify: (req, _res, buf) => { req.rawBody = buf.toString('utf8'); }
-});
+  // Webhook PayPal (POST)
+  const expressJsonForPaypal = (await import('express')).default.json({
+    verify: (req, _res, buf) => { req.rawBody = buf.toString('utf8'); }
+  });
 
-app.post('/paypal/webhook', expressJsonForPaypal, async (req, res) => {
-  try {
-    // 1) Verificar signatura
-    const hdr = {
-      'transmission_id': req.header('paypal-transmission-id'),
-      'transmission_time': req.header('paypal-transmission-time'),
-      'transmission_sig': req.header('paypal-transmission-sig'),
-      'cert_url': req.header('paypal-cert-url'),
-      'auth_algo': req.header('paypal-auth-algo')
-    };
-    const event = req.body;
+  app.post('/paypal/webhook', expressJsonForPaypal, async (req, res) => {
+    try {
+      // 1) Verificar signatura amb l’API de PayPal
+      const hdr = {
+        'transmission_id': req.header('paypal-transmission-id'),
+        'transmission_time': req.header('paypal-transmission-time'),
+        'transmission_sig': req.header('paypal-transmission-sig'),
+        'cert_url': req.header('paypal-cert-url'),
+        'auth_algo': req.header('paypal-auth-algo')
+      };
+      const event = req.body;
 
-    if (!PAYPAL_WEBHOOK_ID) throw new Error('Falta PAYPAL_WEBHOOK_ID');
-    const access = await paypalAccessToken();
-    const vr = await fetch(`${PAYPAL_API_BASE}/v1/notifications/verify-webhook-signature`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${access}` },
-      body: JSON.stringify({
-        auth_algo: hdr.auth_algo,
-        cert_url: hdr.cert_url,
-        transmission_id: hdr.transmission_id,
-        transmission_sig: hdr.transmission_sig,
-        transmission_time: hdr.transmission_time,
-        webhook_id: PAYPAL_WEBHOOK_ID,
-        webhook_event: event
-      })
-    }).then(r => r.json());
+      if (!PAYPAL_WEBHOOK_ID) throw new Error('Falta PAYPAL_WEBHOOK_ID');
+      const access = await paypalAccessToken();
+      const vr = await fetch(`${PAYPAL_API_BASE}/v1/notifications/verify-webhook-signature`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${access}` },
+        body: JSON.stringify({
+          auth_algo: hdr.auth_algo,
+          cert_url: hdr.cert_url,
+          transmission_id: hdr.transmission_id,
+          transmission_sig: hdr.transmission_sig,
+          transmission_time: hdr.transmission_time,
+          webhook_id: PAYPAL_WEBHOOK_ID,
+          webhook_event: event
+        })
+      }).then(r => r.json());
 
-    if (vr?.verification_status !== 'SUCCESS') {
-      console.warn('PayPal webhook: verificació fallida', vr);
-      return res.status(400).send('invalid');
-    }
+      if (vr?.verification_status !== 'SUCCESS') {
+        console.warn('PayPal webhook: verificació fallida', vr);
+        return res.status(400).send('invalid');
+      }
 
-    // 2) Gestionar esdeveniments
-    const type = event.event_type;
-    // Helpers per trobar comanda nostra a partir de l’orderId PayPal
-    async function findOurOrderByPayPalOrderId(ppOrderId) {
-      return (await pool.query(`SELECT * FROM orders WHERE payment_id=$1 ORDER BY id DESC LIMIT 1`, [ppOrderId])).rows[0];
-    }
+      // 2) Gestionar esdeveniments
+      const type = event.event_type;
 
-    if (type === 'CHECKOUT.ORDER.APPROVED') {
-      // L’usuari ha aprovat a PayPal però potser no ha tornat al bot → capturem nosaltres
-      const ppOrderId = event.resource?.id;
-      if (ppOrderId) {
-        const our = await findOurOrderByPayPalOrderId(ppOrderId);
-        if (our && our.payment_status !== 'PAID') {
-          const cap = await paypalCaptureOrder(ppOrderId);
-          const paid = (cap?.status === 'COMPLETED') ||
-                       (cap?.purchase_units?.[0]?.payments?.captures?.[0]?.status === 'COMPLETED');
-          await db.setOrderPaymentInfo(our.id, {
-            payment_status: paid ? 'PAID' : 'UNPAID',
-            payment_id: ppOrderId,
-            payment_receipt_json: cap,
-            paid_at: paid ? new Date().toISOString() : null
-          });
-          const updated = await db.getOrderById(our.id);
-          // Notificar admins una sola vegada
-          if (paid && !updated.notified_at) {
-            await notifyAdminsOfOrder(updated);
-            await db.setOrderPaymentInfo(updated.id, { notified_at: new Date().toISOString() });
+      async function findOurOrderByPayPalOrderId(ppOrderId) {
+        return (await pool.query(`SELECT * FROM orders WHERE payment_id=$1 ORDER BY id DESC LIMIT 1`, [ppOrderId])).rows[0];
+      }
+
+      if (type === 'CHECKOUT.ORDER.APPROVED') {
+        const ppOrderId = event.resource?.id;
+        if (ppOrderId) {
+          const our = await findOurOrderByPayPalOrderId(ppOrderId);
+          if (our && our.payment_status !== 'PAID') {
+            const cap = await paypalCaptureOrder(ppOrderId);
+            const paid = (cap?.status === 'COMPLETED') ||
+                         (cap?.purchase_units?.[0]?.payments?.captures?.[0]?.status === 'COMPLETED');
+            await db.setOrderPaymentInfo(our.id, {
+              payment_status: paid ? 'PAID' : 'UNPAID',
+              payment_id: ppOrderId,
+              payment_receipt_json: cap,
+              paid_at: paid ? new Date().toISOString() : null
+            });
+            const updated = await db.getOrderById(our.id);
+            if (paid && !updated.notified_at) {
+              await notifyAdminsOfOrder(updated);
+              await db.setOrderPaymentInfo(updated.id, { notified_at: new Date().toISOString() });
+            }
           }
         }
       }
-    }
 
-    if (type === 'PAYMENT.CAPTURE.COMPLETED') {
-      // Pagament capturat: marquem com pagat si cal i notifiquem
-      const capture = event.resource;
-      const ppOrderId =
-        capture?.supplementary_data?.related_ids?.order_id
-        || (capture?.links || []).find(l => l.rel === 'up')?.href?.split('/')?.pop();
+      if (type === 'PAYMENT.CAPTURE.COMPLETED') {
+        const capture = event.resource;
+        const ppOrderId =
+          capture?.supplementary_data?.related_ids?.order_id
+          || (capture?.links || []).find(l => l.rel === 'up')?.href?.split('/')?.pop();
 
-      if (ppOrderId) {
-        const our = await findOurOrderByPayPalOrderId(ppOrderId);
-        if (our && our.payment_status !== 'PAID') {
-          await db.setOrderPaymentInfo(our.id, {
-            payment_status: 'PAID',
-            payment_id: ppOrderId,
-            // Guardem l’últim event per traça
-            payment_receipt_json: capture,
-            paid_at: new Date().toISOString()
-          });
-          const updated = await db.getOrderById(our.id);
-          if (!updated.notified_at) {
-            await notifyAdminsOfOrder(updated);
-            await db.setOrderPaymentInfo(updated.id, { notified_at: new Date().toISOString() });
+        if (ppOrderId) {
+          const our = await findOurOrderByPayPalOrderId(ppOrderId);
+          if (our && our.payment_status !== 'PAID') {
+            await db.setOrderPaymentInfo(our.id, {
+              payment_status: 'PAID',
+              payment_id: ppOrderId,
+              payment_receipt_json: capture,
+              paid_at: new Date().toISOString()
+            });
+            const updated = await db.getOrderById(our.id);
+            if (!updated.notified_at) {
+              await notifyAdminsOfOrder(updated);
+              await db.setOrderPaymentInfo(updated.id, { notified_at: new Date().toISOString() });
+            }
           }
         }
       }
-    }
 
-    res.send('OK');
-  } catch (e) {
-    console.error('paypal/webhook error:', e.message);
-    res.status(200).send('OK'); // Respondre 200 sempre per evitar reintents infinits; loguegem errors
-  }
-});
+      res.send('OK');
+    } catch (e) {
+      console.error('paypal/webhook error:', e.message);
+      res.status(200).send('OK'); // Respondre 200 per evitar reintents continus
+    }
+  });
 
   app.use(bot.webhookCallback(HOOK_PATH));
   if (!APP_URL) throw new Error('Falta APP_URL per al webhook');
@@ -795,11 +858,11 @@ app.post('/paypal/webhook', expressJsonForPaypal, async (req, res) => {
   console.log('Bot running (long polling)');
 }
 
-/* ───────── Cerca lliure (IMPORTANT: al FINAL) ───────── */
+/* ───────── Cerca lliure (mantenir al FINAL) ───────── */
 bot.on('text', async (ctx) => {
   // si estem dins d'un formulari, no fem cerca
   const s = getS(ctx.from.id);
-  if (['ASK_SIZE', 'ASK_SIZE_EDIT', 'ASK_NAME', 'ASK_ADDR'].includes(s.step)) return;
+  if (['ASK_SIZE','ASK_SIZE_EDIT','ASK_NAME','ASK_ADDR','REQ_SIZE','REQ_NOTES'].includes(s.step)) return;
 
   const q = (ctx.message.text || '').trim();
   if (!q) return;
@@ -809,12 +872,18 @@ bot.on('text', async (ctx) => {
   if (['categories', '📂 categories', 'marques', '🏷️ marques', 'veure cistella', '🧺 veure cistella'].includes(lower)) return;
 
   await db.insertQuery(ctx.from.id, ctx.from.username || '', q);
+
   const rows = await db.listProductsLike(`%${q}%`);
-  if (!rows.length) return ctx.reply('No he trobat res amb aquesta cerca. Prova una altra paraula o obre el catàleg.');
+  if (!rows.length) {
+    const kb = Markup.inlineKeyboard([
+      [Markup.button.callback('📨 Demanar aquest producte', `REQ|${encodeURIComponent(q)}`)]
+    ]);
+    return ctx.reply(`No he trobat res per «${q}».\nVols que el busquem per tu?`, kb);
+  }
+
   const kb = rows.map(p => [Markup.button.callback(`🧩 ${p.name}`, `P_${p.id}`)]);
   await ctx.reply('He trobat això. Tria un producte:', Markup.inlineKeyboard(kb));
 });
 
 process.once('SIGINT', () => { try { bot.stop('SIGINT'); } catch {} });
 process.once('SIGTERM', () => { try { bot.stop('SIGTERM'); } catch {} });
-

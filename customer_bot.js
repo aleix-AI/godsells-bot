@@ -280,6 +280,8 @@ bot.hears([/🏷️\s*Marques/i, /^(\p{Emoji_Presentation}?\s*)?marques$/iu], as
   const rows = brs.map(b => [Markup.button.callback(`${b.brand} (${b.n})`, `BRAND|${enc(b.brand)}|0`)]);
   await ctx.reply('Tria una marca:', Markup.inlineKeyboard(rows));
 });
+// Teclat: "🧺 Veure cistella"
+bot.hears([/🧺\s*Veure cistella/i, /^veure cistella$/i], (ctx) => showCart(ctx));
 
 /* Llistats amb paginació per categoria/marca */
 async function renderList(ctx, mode, value, page) {
@@ -455,6 +457,15 @@ bot.action(/INC_(\d+)/, async (ctx) => { await ctx.answerCbQuery(); const idx = 
 bot.action(/DEC_(\d+)/, async (ctx) => { await ctx.answerCbQuery(); const idx = +ctx.match[1]; const s = getS(ctx.from.id); if (!s.cart?.[idx]) return; s.cart[idx].qty = Math.max(0, (s.cart[idx].qty || 1) - 1); if (s.cart[idx].qty === 0) s.cart.splice(idx, 1); setS(ctx.from.id, s); await persistCart(ctx, s.cart); return renderCart(ctx, true); });
 bot.action(/DEL_(\d+)/, async (ctx) => { await ctx.answerCbQuery(); const idx = +ctx.match[1]; const s = getS(ctx.from.id); if (!s.cart?.[idx]) return; s.cart.splice(idx, 1); setS(ctx.from.id, s); await persistCart(ctx, s.cart); return renderCart(ctx, true); });
 bot.action(/EDIT_SIZE_(\d+)/, async (ctx) => { await ctx.answerCbQuery(); const idx = +ctx.match[1]; const s = getS(ctx.from.id); if (!s.cart?.[idx]) return; setS(ctx.from.id, { ...s, step: 'ASK_SIZE_EDIT', editIndex: idx }); return ctx.reply(`Escriu la nova talla per a «${s.cart[idx].productName}» (actual: ${s.cart[idx].size || '-'})`); });
+// Buidar cistella (inline)
+bot.action('CLEAR_CART', async (ctx) => {
+  await ctx.answerCbQuery();
+  const s = getS(ctx.from.id) || {};
+  setS(ctx.from.id, { ...s, cart: [] });
+  try { await persistCart(ctx, []); } catch {}
+  try { await ctx.editMessageText('🧹 Cistella buidada.'); }
+  catch { await ctx.reply('🧹 Cistella buidada.'); }
+});
 
 /* ───────── Formularis (talla manual, edició talla, nom, adreça) ───────── */
 bot.on('text', async (ctx, next) => { // talla manual (després d'ASKSZ)
@@ -953,3 +964,4 @@ bot.on('text', async (ctx) => {
 
 process.once('SIGINT', () => { try { bot.stop('SIGINT'); } catch {} });
 process.once('SIGTERM', () => { try { bot.stop('SIGTERM'); } catch {} });
+

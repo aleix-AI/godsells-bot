@@ -1,4 +1,4 @@
-// customer_bot.js — Cistella, talles per categoria, PayPal (LIVE o sandbox), perfil i peticions de producte
+// customer_bot.js — Cistella, talles per categoria, PayPal, perfil, peticions i CERCADOR PAGINAT
 import 'dotenv/config';
 import { Telegraf, Markup } from 'telegraf';
 import pkg from 'pg';
@@ -82,8 +82,43 @@ await ensureSchema();
 
 /* ───────── DB helpers ───────── */
 const db = {
+  // Cerca antiga (ja no la fem servir per la UI, però la deixo per compatibilitat)
   listProductsLike: async (q) =>
     (await pool.query('SELECT * FROM products WHERE name ILIKE $1 ORDER BY id DESC LIMIT 25', [q])).rows,
+
+  // <<< NOVETAT: cerca paginada sobre nom, marca, categoria i tags >>>
+  countBySearch: async (q) => {
+    const like = `%${q}%`;
+    const r = await pool.query(`
+      SELECT COUNT(*)::int AS n
+      FROM products p
+      WHERE p.name ILIKE $1
+         OR p.brand ILIKE $1
+         OR p.category ILIKE $1
+         OR EXISTS (
+              SELECT 1 FROM jsonb_array_elements_text(COALESCE(p.tags,'[]'::jsonb)) t
+              WHERE t ILIKE $1
+            )
+    `, [like]);
+    return Number(r.rows[0]?.n || 0);
+  },
+  pageBySearch: async (q, limit, offset) => {
+    const like = `%${q}%`;
+    const r = await pool.query(`
+      SELECT *
+      FROM products p
+      WHERE p.name ILIKE $1
+         OR p.brand ILIKE $1
+         OR p.category ILIKE $1
+         OR EXISTS (
+              SELECT 1 FROM jsonb_array_elements_text(COALESCE(p.tags,'[]'::jsonb)) t
+              WHERE t ILIKE $1
+            )
+      ORDER BY id DESC
+      LIMIT $2 OFFSET $3
+    `, [like, limit, offset]);
+    return r.rows;
+  },
 
   getProduct: async (id) =>
     (await pool.query('SELECT * FROM products WHERE id=$1', [id])).rows[0],
@@ -246,7 +281,7 @@ bot.hears([/🏷️\s*Marques/i, /^(\p{Emoji_Presentation}?\s*)?marques$/iu], as
   await ctx.reply('Tria una marca:', Markup.inlineKeyboard(rows));
 });
 
-/* Llistats amb paginació */
+/* Llistats amb paginació per categoria/marca */
 async function renderList(ctx, mode, value, page) {
   const offset = page * PAGE_SIZE;
   let total = 0, rows = [];
@@ -669,7 +704,7 @@ bot.on('text', async (ctx, next) => {
     console.error('insert product_request error:', e.message);
   }
 
-  // Avisa admins
+  // Avisa admins (directe a ADMIN_CHAT_IDS)
   const text =
     `📥 *Nova petició de producte*\n` +
     `Usuari: ${ctx.from.username ? '@'+ctx.from.username : ctx.from.id}\n` +
@@ -708,7 +743,7 @@ if (USE_WEBHOOK) {
         payment_id: token,
         payment_receipt_json: capture,
         paid_at: paid ? new Date().toISOString() : null,
-        notified_at: paid ? new Date().toISOString() : null // marquem notificat per evitar dobles avisos
+        notified_at: paid ? new Date().toISOString() : null // evitem dobles avisos
       });
 
       const o = await db.getOrderById(orderId);
@@ -858,7 +893,48 @@ if (USE_WEBHOOK) {
   console.log('Bot running (long polling)');
 }
 
-/* ───────── Cerca lliure (mantenir al FINAL) ───────── */
+/* ───────── CERCADOR PAGINAT (AL FINAL) ───────── */
+async function renderSearch(ctx, q, page) {
+  const total = await db.countBySearch(q);
+  if (!total) {
+    const kb = Markup.inlineKeyboard([
+      [Markup.button.callback('📨 Demanar aquest producte', `REQ|${encodeURIComponent(q)}`)]
+    ]);
+    return ctx.reply(`No he trobat res per «${q}».\nVols que el busquem per tu?`, kb);
+  }
+  const pages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  const rows = await db.pageBySearch(q, PAGE_SIZE, page * PAGE_SIZE);
+  const items = rows.map(p => [Markup.button.callback(`🧩 ${p.name}`, `P_${p.id}`)]);
+  const nav = [];
+  if (page > 0) nav.push(Markup.button.callback('◀️ Ant', `SEARCH|${encodeURIComponent(q)}|${page - 1}`));
+  nav.push(Markup.button.callback(`Pàg. ${page + 1}/${pages}`, 'NOOP'));
+  if (page < pages - 1) nav.push(Markup.button.callback('▶️ Seg', `SEARCH|${encodeURIComponent(q)}|${page + 1}`));
+  items.push(nav);
+  const title = `Resultats per «${q}» (${total})`;
+  return ctx.reply(title, Markup.inlineKeyboard(items));
+}
+bot.action(/^SEARCH\|(.+)\|(\d+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const q = decodeURIComponent(ctx.match[1]);
+  const page = Number(ctx.match[2]);
+  // Intenta editar; si el missatge no es pot editar (perquè no és del bot), envia’l de nou
+  try {
+    const total = await db.countBySearch(q);
+    const pages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+    const rows = await db.pageBySearch(q, PAGE_SIZE, page * PAGE_SIZE);
+    const items = rows.map(p => [Markup.button.callback(`🧩 ${p.name}`, `P_${p.id}`)]);
+    const nav = [];
+    if (page > 0) nav.push(Markup.button.callback('◀️ Ant', `SEARCH|${encodeURIComponent(q)}|${page - 1}`));
+    nav.push(Markup.button.callback(`Pàg. ${page + 1}/${pages}`, 'NOOP'));
+    if (page < pages - 1) nav.push(Markup.button.callback('▶️ Seg', `SEARCH|${encodeURIComponent(q)}|${page + 1}`));
+    items.push(nav);
+    await ctx.editMessageText(`Resultats per «${q}» (${total})`, Markup.inlineKeyboard(items));
+  } catch {
+    await renderSearch(ctx, q, page);
+  }
+});
+
+/* Cerca lliure: activa el paginador */
 bot.on('text', async (ctx) => {
   // si estem dins d'un formulari, no fem cerca
   const s = getS(ctx.from.id);
@@ -872,17 +948,7 @@ bot.on('text', async (ctx) => {
   if (['categories', '📂 categories', 'marques', '🏷️ marques', 'veure cistella', '🧺 veure cistella'].includes(lower)) return;
 
   await db.insertQuery(ctx.from.id, ctx.from.username || '', q);
-
-  const rows = await db.listProductsLike(`%${q}%`);
-  if (!rows.length) {
-    const kb = Markup.inlineKeyboard([
-      [Markup.button.callback('📨 Demanar aquest producte', `REQ|${encodeURIComponent(q)}`)]
-    ]);
-    return ctx.reply(`No he trobat res per «${q}».\nVols que el busquem per tu?`, kb);
-  }
-
-  const kb = rows.map(p => [Markup.button.callback(`🧩 ${p.name}`, `P_${p.id}`)]);
-  await ctx.reply('He trobat això. Tria un producte:', Markup.inlineKeyboard(kb));
+  return renderSearch(ctx, q, 0);
 });
 
 process.once('SIGINT', () => { try { bot.stop('SIGINT'); } catch {} });

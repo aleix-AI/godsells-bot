@@ -1,4 +1,4 @@
-// admin_bot.js — Comandes, reemborsaments, avisos pendents + PETICIONS de producte
+// admin_bot.js — Comandes, reemborsaments, avisos pendents, PETICIONS i VENDES MENSUALS
 import 'dotenv/config';
 import { Telegraf, Markup } from 'telegraf';
 import pkg from 'pg';
@@ -30,14 +30,14 @@ const toEuro = (c) => (Number(c || 0) / 100).toLocaleString('es-ES', { style: 'c
 
 /* ───────── DB bootstrap (migracions suaus) ───────── */
 async function ensureColumns() {
-  // Columns per avisos de comandes pendents
+  // Orders: camps per avisos pendents
   await pool.query(`
     ALTER TABLE orders
       ADD COLUMN IF NOT EXISTS overdue_alerted_at timestamptz,
       ADD COLUMN IF NOT EXISTS overdue_snooze_until timestamptz
   `).catch(()=>{});
 
-  // Taula de peticions de producte (si no existeix) + columna de notificació
+  // product_requests + notified_at
   await pool.query(`
     CREATE TABLE IF NOT EXISTS product_requests (
       id SERIAL PRIMARY KEY,
@@ -57,7 +57,7 @@ async function ensureColumns() {
 }
 await ensureColumns();
 
-/* ───────── PayPal helpers (per a reemborsaments) ───────── */
+/* ───────── PayPal helpers (reemborsaments) ───────── */
 async function paypalAccessToken() {
   if (!PAYPAL_CLIENT_ID || !PAYPAL_SECRET) throw new Error('Falten credencials PayPal (admin-bot)');
   const res = await fetch(`${PAYPAL_API_BASE}/v1/oauth2/token`, {
@@ -71,7 +71,6 @@ async function paypalAccessToken() {
   if (!res.ok) throw new Error('PayPal OAuth error');
   return (await res.json()).access_token;
 }
-
 function extractCaptureId(payment_receipt_json) {
   try {
     const j = typeof payment_receipt_json === 'string' ? JSON.parse(payment_receipt_json) : payment_receipt_json;
@@ -79,7 +78,6 @@ function extractCaptureId(payment_receipt_json) {
     return cap || null;
   } catch { return null; }
 }
-
 async function refundCapture(captureId, totalCents) {
   const access = await paypalAccessToken();
   const res = await fetch(`${PAYPAL_API_BASE}/v2/payments/captures/${captureId}/refund`, {
@@ -125,6 +123,23 @@ const db = {
 
   getRequest: async (id) =>
     (await pool.query(`SELECT * FROM product_requests WHERE id=$1`, [id])).rows[0],
+
+  // <<< NOVETAT: vendes del mes actual >>>
+  currentMonthSales: async () => {
+    const q = await pool.query(`
+      WITH bounds AS (
+        SELECT date_trunc('month', now()) AS start,
+               date_trunc('month', now()) + interval '1 month' AS stop
+      )
+      SELECT
+        COUNT(*) FILTER (WHERE payment_status='PAID')::int AS orders_paid,
+        COALESCE(SUM(CASE WHEN payment_status='PAID' THEN total_cents END),0)::bigint AS revenue_cents,
+        COALESCE(SUM(CASE WHEN payment_status='PAID' THEN total_cost_cents END),0)::bigint AS cost_cents
+      FROM orders, bounds
+      WHERE created_at >= bounds.start AND created_at < bounds.stop
+    `);
+    return q.rows[0] || { orders_paid: 0, revenue_cents: 0, cost_cents: 0 };
+  }
 };
 
 /* ───────── Format helpers ───────── */
@@ -137,19 +152,16 @@ function formatItems(items_json) {
     ).join('\n');
   } catch { return '(buit)'; }
 }
-
 function orderLine(o) {
   const when = new Date(o.created_at).toLocaleString('es-ES');
   return `#${o.id} — ${when} — ${o.customer_name || o.username || o.user_id} — ${toEuro(o.total_cents)} — ${o.status}/${o.payment_status}`;
 }
-
 function orderButtons(o) {
   const rows = [];
   rows.push([Markup.button.callback('✅ Marcar realitzada', `ORDER_DONE_${o.id}`)]);
   if (o.payment_status === 'PAID') rows.push([Markup.button.callback('↩️ Reemborsar', `ORDER_REFUND_${o.id}`)]);
   return Markup.inlineKeyboard(rows);
 }
-
 function overdueButtons(o) {
   return Markup.inlineKeyboard([
     [Markup.button.callback('✅ Marcar realitzada', `ORDER_DONE_${o.id}`)],
@@ -157,7 +169,7 @@ function overdueButtons(o) {
   ]);
 }
 
-/* ───────── Peticions: format + botons ───────── */
+/* Peticions: format + botons */
 function reqButtonsInline(r) {
   return Markup.inlineKeyboard([
     [Markup.button.callback('✅ Acceptar', `REQ_ACCEPT_${r.id}`), Markup.button.callback('❌ Rebutjar', `REQ_REJECT_${r.id}`)],
@@ -187,7 +199,8 @@ function formatReq(r) {
 admin.start((ctx) => {
   if (!isAdmin(ctx)) return ctx.reply('No autoritzat.');
   ctx.reply('🛠️ Admin', Markup.keyboard([
-    ['📦 Llistar comandes', '📥 Peticions']
+    ['📦 Llistar comandes', '📥 Peticions'],
+    ['📊 Vendes (mes)']
   ]).resize());
 });
 
@@ -203,6 +216,35 @@ admin.hears('📥 Peticions', async (ctx) => {
   const rows = await db.listRequests('NEW', 30);
   if (!rows.length) return ctx.reply('Sense peticions noves.');
   for (const r of rows) await ctx.reply(formatReq(r), reqButtonsInline(r));
+});
+
+/* >>> Nova opció: VENDES DEL MES ACTUAL <<< */
+admin.hears('📊 Vendes (mes)', async (ctx) => {
+  if (!isAdmin(ctx)) return;
+  try {
+    const { orders_paid, revenue_cents, cost_cents } = await db.currentMonthSales();
+    const profit_cents = Number(revenue_cents) - Number(cost_cents);
+    const avg_cents = Number(orders_paid) ? Math.round(Number(revenue_cents) / Number(orders_paid)) : 0;
+
+    // Nom del mes (locale)
+    const now = new Date();
+    const monthLabel = now.toLocaleDateString('es-ES', { month: 'long', year: 'numeric' });
+
+    const msg = [
+      `📊 *Vendes del mes* (${monthLabel})`,
+      `Comandes pagades: ${orders_paid}`,
+      `Ingressos: ${toEuro(revenue_cents)}`,
+      `Cost estimat: ${toEuro(cost_cents)}`,
+      `Benefici: ${toEuro(profit_cents)}`,
+      `Tiquet mitjà: ${toEuro(avg_cents)}`
+    ].join('\n');
+
+    try { await ctx.reply(msg, { parse_mode: 'Markdown' }); }
+    catch { await ctx.reply(msg); }
+  } catch (e) {
+    console.error('currentMonthSales error:', e.message);
+    await ctx.reply('No s’ha pogut calcular les vendes. Prova en uns segons.');
+  }
 });
 
 /* ───────── Accions de comandes ───────── */
@@ -259,10 +301,7 @@ admin.action(/REQ_ACCEPT_(\d+)/, async (ctx) => {
   const r = await db.getRequest(id);
   await ctx.answerCbQuery('Acceptada');
   try { await ctx.editMessageText(formatReq(r), reqButtonsInline(r)); } catch {}
-  // (Opcional) avisar l'usuari: descomenta si vols
-  // try { await admin.telegram.sendMessage(r.user_id, `👌 Hem acceptat la teva petició per «${r.desired_name}».`); } catch {}
 });
-
 admin.action(/REQ_REJECT_(\d+)/, async (ctx) => {
   if (!isAdmin(ctx)) return ctx.answerCbQuery('No autoritzat');
   const id = Number(ctx.match[1]);
@@ -270,9 +309,7 @@ admin.action(/REQ_REJECT_(\d+)/, async (ctx) => {
   const r = await db.getRequest(id);
   await ctx.answerCbQuery('Rebutjada');
   try { await ctx.editMessageText(formatReq(r), reqButtonsInline(r)); } catch {}
-  // try { await admin.telegram.sendMessage(r.user_id, `Ho sentim, ara mateix no podem aconseguir «${r.desired_name}».`); } catch {}
 });
-
 admin.action(/REQ_DONE_(\d+)/, async (ctx) => {
   if (!isAdmin(ctx)) return ctx.answerCbQuery('No autoritzat');
   const id = Number(ctx.match[1]);
@@ -280,7 +317,6 @@ admin.action(/REQ_DONE_(\d+)/, async (ctx) => {
   const r = await db.getRequest(id);
   await ctx.answerCbQuery('Marcada com feta');
   try { await ctx.editMessageText(formatReq(r), reqButtonsInline(r)); } catch {}
-  // try { await admin.telegram.sendMessage(r.user_id, `✅ La teva petició «${r.desired_name}» s’ha completat.`); } catch {}
 });
 
 admin.action('NOOP', (ctx) => ctx.answerCbQuery());
@@ -309,7 +345,6 @@ async function sendOverdueMessage(o) {
     }
   }
 }
-
 async function checkOverdue() {
   try {
     const q = await pool.query(`

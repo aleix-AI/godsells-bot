@@ -82,11 +82,11 @@ await ensureSchema();
 
 /* ───────── DB helpers ───────── */
 const db = {
-  // Cerca antiga (ja no la fem servir per la UI, però la deixo per compatibilitat)
+  // Cerca antiga (compatibilitat)
   listProductsLike: async (q) =>
     (await pool.query('SELECT * FROM products WHERE name ILIKE $1 ORDER BY id DESC LIMIT 25', [q])).rows,
 
-  // <<< NOVETAT: cerca paginada sobre nom, marca, categoria i tags >>>
+  // <<< Cerca paginada nom/brand/category/tags >>>
   countBySearch: async (q) => {
     const like = `%${q}%`;
     const r = await pool.query(`
@@ -928,7 +928,6 @@ bot.action(/^SEARCH\|(.+)\|(\d+)$/, async (ctx) => {
   await ctx.answerCbQuery();
   const q = decodeURIComponent(ctx.match[1]);
   const page = Number(ctx.match[2]);
-  // Intenta editar; si el missatge no es pot editar (perquè no és del bot), envia’l de nou
   try {
     const total = await db.countBySearch(q);
     const pages = Math.max(1, Math.ceil(total / PAGE_SIZE));
@@ -947,14 +946,12 @@ bot.action(/^SEARCH\|(.+)\|(\d+)$/, async (ctx) => {
 
 /* Cerca lliure: activa el paginador */
 bot.on('text', async (ctx) => {
-  // si estem dins d'un formulari, no fem cerca
   const s = getS(ctx.from.id);
   if (['ASK_SIZE','ASK_SIZE_EDIT','ASK_NAME','ASK_ADDR','REQ_SIZE','REQ_NOTES'].includes(s.step)) return;
 
   const q = (ctx.message.text || '').trim();
   if (!q) return;
 
-  // paraules que ja cobreixen altres handlers
   const lower = q.toLowerCase();
   if (['categories', '📂 categories', 'marques', '🏷️ marques', 'veure cistella', '🧺 veure cistella'].includes(lower)) return;
 
@@ -964,4 +961,3 @@ bot.on('text', async (ctx) => {
 
 process.once('SIGINT', () => { try { bot.stop('SIGINT'); } catch {} });
 process.once('SIGTERM', () => { try { bot.stop('SIGTERM'); } catch {} });
-

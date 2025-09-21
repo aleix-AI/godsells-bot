@@ -1,4 +1,4 @@
-// admin_bot.js — Comandes, reemborsaments, avisos pendents, PETICIONS i VENDES MENSUALS
+// admin_bot.js — Comandes, reemborsos PayPal, avisos, peticions i VENDES MENSUALS
 import 'dotenv/config';
 import { Telegraf, Markup } from 'telegraf';
 import pkg from 'pg';
@@ -93,7 +93,7 @@ async function refundCapture(captureId, totalCents) {
 /* ───────── DB helpers ───────── */
 const db = {
   listLatestOrders: async (limit = 20) =>
-    (await pool.query(`SELECT id, created_at, username, customer_name, address_text, total_cents, status, payment_status
+    (await pool.query(`SELECT id, created_at, username, user_id, customer_name, address_text, total_cents, status, payment_status
                        FROM orders ORDER BY id DESC LIMIT $1`, [limit])).rows,
 
   getOrder: async (id) =>
@@ -124,7 +124,7 @@ const db = {
   getRequest: async (id) =>
     (await pool.query(`SELECT * FROM product_requests WHERE id=$1`, [id])).rows[0],
 
-  // <<< NOVETAT: vendes del mes actual >>>
+  // >>> Vendes del mes actual <<<
   currentMonthSales: async () => {
     const q = await pool.query(`
       WITH bounds AS (
@@ -226,7 +226,6 @@ admin.hears('📊 Vendes (mes)', async (ctx) => {
     const profit_cents = Number(revenue_cents) - Number(cost_cents);
     const avg_cents = Number(orders_paid) ? Math.round(Number(revenue_cents) / Number(orders_paid)) : 0;
 
-    // Nom del mes (locale)
     const now = new Date();
     const monthLabel = now.toLocaleDateString('es-ES', { month: 'long', year: 'numeric' });
 
@@ -255,6 +254,14 @@ admin.action(/ORDER_DONE_(\d+)/, async (ctx) => {
   await ctx.answerCbQuery('Comanda marcada com realitzada');
   const o = await db.getOrder(id);
   try { await ctx.editMessageText(orderLine(o), orderButtons(o)); } catch {}
+});
+
+admin.action(/OVERDUE_SNOOZE_(\d+)_(\d+)/, async (ctx) => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery('No autoritzat');
+  const id = Number(ctx.match[1]);
+  const minutes = Number(ctx.match[2] || '120');
+  await db.snoozeOverdue(id, minutes);
+  await ctx.answerCbQuery(`Snooze ${minutes} min`);
 });
 
 admin.action(/ORDER_REFUND_(\d+)/, async (ctx) => {
@@ -396,8 +403,24 @@ async function checkNewRequests() {
 setInterval(checkNewRequests, 30 * 1000);
 checkNewRequests();
 
-/* ───────── Launch ───────── */
-admin.catch((err, ctx) => { console.error('Admin bot error', err); try { ctx.reply('Error.'); } catch {} });
-admin.launch().then(() => console.log('Admin listening on 8080'));
+/* ───────── Launch (Webhook opcional) ───────── */
+const USE_WEBHOOK = String(process.env.USE_WEBHOOK).toLowerCase() === 'true';
+const PORT = Number(process.env.PORT || 3000);
+const APP_URL = process.env.APP_URL;
+const HOOK_PATH = process.env.HOOK_PATH || '/tghook';
+
+if (USE_WEBHOOK) {
+  const express = (await import('express')).default;
+  const app = express();
+  app.use(admin.webhookCallback(HOOK_PATH));
+  if (!APP_URL) throw new Error('Falta APP_URL per al webhook');
+  await admin.telegram.setWebhook(`${APP_URL}${HOOK_PATH}`);
+  app.get('/', (_req, res) => res.send('OK'));
+  app.listen(PORT, () => console.log('Admin webhook listening on', PORT));
+} else {
+  await admin.launch();
+  console.log('Admin bot running (long polling)');
+}
+
 process.once('SIGINT', () => admin.stop('SIGINT'));
 process.once('SIGTERM', () => admin.stop('SIGTERM'));

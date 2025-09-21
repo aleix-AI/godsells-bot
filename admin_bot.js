@@ -34,7 +34,8 @@ async function ensureColumns() {
   await pool.query(`
     ALTER TABLE orders
       ADD COLUMN IF NOT EXISTS overdue_alerted_at timestamptz,
-      ADD COLUMN IF NOT EXISTS overdue_snooze_until timestamptz
+      ADD COLUMN IF NOT EXISTS overdue_snooze_until timestamptz,
+      ADD COLUMN IF NOT EXISTS notified_at timestamptz
   `).catch(()=>{});
 
   // product_requests + notified_at
@@ -124,7 +125,7 @@ const db = {
   getRequest: async (id) =>
     (await pool.query(`SELECT * FROM product_requests WHERE id=$1`, [id])).rows[0],
 
-  // <<< NOVETAT: vendes del mes actual >>>
+  // Vendes del mes actual
   currentMonthSales: async () => {
     const q = await pool.query(`
       WITH bounds AS (
@@ -148,7 +149,7 @@ function formatItems(items_json) {
     const items = typeof items_json === 'string' ? JSON.parse(items_json) : (items_json || []);
     if (!Array.isArray(items) || !items.length) return '(buit)';
     return items.map(it =>
-      `• ${it.productName || it.name} — talla ${it.size_label || it.size || '-'} ×${it.qty || 1} = ${toEuro((it.price_cents||0)*(it.qty||1))}`
+      `• ${it.productName || it.name}${it.size ? ` — talla ${it.size}` : ''} ×${it.qty || 1} = ${toEuro((it.price_cents||0)*(it.qty||1))}`
     ).join('\n');
   } catch { return '(buit)'; }
 }
@@ -225,11 +226,8 @@ admin.hears('📊 Vendes (mes)', async (ctx) => {
     const { orders_paid, revenue_cents, cost_cents } = await db.currentMonthSales();
     const profit_cents = Number(revenue_cents) - Number(cost_cents);
     const avg_cents = Number(orders_paid) ? Math.round(Number(revenue_cents) / Number(orders_paid)) : 0;
-
-    // Nom del mes (locale)
     const now = new Date();
     const monthLabel = now.toLocaleDateString('es-ES', { month: 'long', year: 'numeric' });
-
     const msg = [
       `📊 *Vendes del mes* (${monthLabel})`,
       `Comandes pagades: ${orders_paid}`,
@@ -238,9 +236,7 @@ admin.hears('📊 Vendes (mes)', async (ctx) => {
       `Benefici: ${toEuro(profit_cents)}`,
       `Tiquet mitjà: ${toEuro(avg_cents)}`
     ].join('\n');
-
-    try { await ctx.reply(msg, { parse_mode: 'Markdown' }); }
-    catch { await ctx.reply(msg); }
+    try { await ctx.reply(msg, { parse_mode: 'Markdown' }); } catch { await ctx.reply(msg); }
   } catch (e) {
     console.error('currentMonthSales error:', e.message);
     await ctx.reply('No s’ha pogut calcular les vendes. Prova en uns segons.');
@@ -291,14 +287,6 @@ admin.action(/ORDER_REFUND_CONFIRM_(\d+)/, async (ctx) => {
     console.error('Refund error:', e.message);
     await ctx.reply(`Error fent el reemborsament: ${e.message}`);
   }
-});
-
-/* ───────── Accions extra: Snooze pendents ───────── */
-admin.action(/OVERDUE_SNOOZE_(\d+)_(\d+)/, async (ctx) => {
-  if (!isAdmin(ctx)) return ctx.answerCbQuery('No autoritzat');
-  const id = Number(ctx.match[1]); const minutes = Number(ctx.match[2] || '120');
-  await db.snoozeOverdue(id, minutes);
-  await ctx.answerCbQuery(`Snooze ${minutes}′ fet`);
 });
 
 /* ───────── Accions de peticions ───────── */
@@ -404,8 +392,51 @@ async function checkNewRequests() {
 setInterval(checkNewRequests, 30 * 1000);
 checkNewRequests();
 
+/* ───────── NOVETAT: Notificador de COMANDES PAGADES ───────── */
+function formatOrderForAdmin(o) {
+  const lines = [
+    `🧾 *COMANDA #${o.id}*`,
+    `Estat: ${o.status || 'PENDING'} — Pagament: ${o.payment_status || 'UNPAID'}`,
+    `Client: ${o.customer_name}`,
+    `Usuari: ${o.username ? '@'+o.username : o.user_id}`,
+    `Adreça:\n${o.address_text}`,
+    ``,
+    `Productes:`,
+    formatItems(o.items_json),
+    ``,
+    `Total: ${toEuro(o.total_cents)}`
+  ].join('\n');
+  return lines;
+}
+async function checkNewPaidOrders() {
+  try {
+    const q = await pool.query(`
+      SELECT * FROM orders
+      WHERE payment_status='PAID' AND notified_at IS NULL
+      ORDER BY id ASC
+      LIMIT 20
+    `);
+    for (const o of q.rows) {
+      const msg = formatOrderForAdmin(o);
+      for (const chatId of ADMIN_IDS) {
+        try {
+          await admin.telegram.sendMessage(chatId, msg, { parse_mode: 'Markdown', reply_markup: orderButtons(o).reply_markup });
+        } catch (e) {
+          // retry sense Markdown
+          try { await admin.telegram.sendMessage(chatId, msg, { reply_markup: orderButtons(o).reply_markup }); } catch {}
+        }
+      }
+      await pool.query(`UPDATE orders SET notified_at=now() WHERE id=$1`, [o.id]);
+    }
+  } catch (e) {
+    console.error('checkNewPaidOrders error:', e.message);
+  }
+}
+setInterval(checkNewPaidOrders, 15 * 1000);
+checkNewPaidOrders();
+
 /* ───────── Launch ───────── */
 admin.catch((err, ctx) => { console.error('Admin bot error', err); try { ctx.reply('Error.'); } catch {} });
-admin.launch().then(() => console.log('Admin running'));
+admin.launch().then(() => console.log('Admin listening on 8080'));
 process.once('SIGINT', () => admin.stop('SIGINT'));
 process.once('SIGTERM', () => admin.stop('SIGTERM'));

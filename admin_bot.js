@@ -2,7 +2,7 @@
 import 'dotenv/config';
 import { Telegraf, Markup } from 'telegraf';
 import pkg from 'pg';
-const { Pool } = pkg;
+const { Pool, Client } = pkg;
 
 /* ───────── Config ───────── */
 const ADMIN_BOT_TOKEN = process.env.ADMIN_BOT_TOKEN;
@@ -110,6 +110,78 @@ function toAdminMsg(o) {
     `Total: ${toEuro(o.total_cents)}`
   ].join('\n');
 }
+/* ───────── PG LISTENER: NOTIFICA NOVES ORDRES IMMEDIATAMENT ─────────
+   Aquest bloc fa LISTEN al canal 'new_order'. Quan arriba una notificació,
+   busca la comanda i envia el mateix missatge que fas servir al poll.
+   També marca notified_at per evitar duplicats. */
+(async function startPgListener() {
+  try {
+    const listenClient = new Client({
+      connectionString: process.env.DATABASE_URL,
+      ssl: process.env.PGSSLMODE === 'require' ? ({ rejectUnauthorized: false }) : false
+    });
+
+    listenClient.on('error', (err) => {
+      console.error('PG listen client error:', err?.message || err);
+    });
+
+    await listenClient.connect();
+    await listenClient.query('LISTEN new_order');
+    console.log('PG LISTEN new_order actiu');
+
+    listenClient.on('notification', async (msg) => {
+      try {
+        if (!msg || msg.channel !== 'new_order') return;
+        const payload = msg.payload ? JSON.parse(msg.payload) : {};
+        const orderId = payload && (payload.orderId || payload.id);
+        if (!orderId) {
+          console.warn('NOTIFY new_order sense orderId:', msg.payload);
+          return;
+        }
+
+        // Recupera la comanda tal com fas a db.getOrder
+        const o = await db.getOrder(Number(orderId));
+        if (!o) {
+          console.warn('Nou notify però no trobo la comanda id=', orderId);
+          return;
+        }
+
+        // Envia el missatge als admins reutilitzant el format existent
+        const msgText = toAdminMsg(o);
+        for (const chatId of ADMIN_IDS) {
+          try {
+            await admin.telegram.sendMessage(chatId, msgText, { parse_mode: 'Markdown', reply_markup: orderButtons(o).reply_markup });
+          } catch (sendErr) {
+            // fallback sense markdown
+            try { await admin.telegram.sendMessage(chatId, msgText, { reply_markup: orderButtons(o).reply_markup }); } catch(e){ /* ignore */ }
+            console.error('Error enviant notificació a', chatId, sendErr?.message || sendErr);
+          }
+        }
+
+        // Marca com a notificat per evitar que el poll posterior l'enviï de nou
+        try {
+          await pool.query(`UPDATE orders SET notified_at = now() WHERE id = $1`, [o.id]);
+        } catch (markErr) {
+          console.error('Error marcant notified_at per ordre', o.id, markErr?.message || markErr);
+        }
+
+      } catch (err) {
+        console.error('Error gestionant notification new_order:', err?.message || err);
+      }
+    });
+
+    // Si el client es tanca, intentem reconnectar (simple retry)
+    listenClient.on('end', () => {
+      console.warn('Listen client tancat; reintentant en 10s...');
+      setTimeout(startPgListener, 10000);
+    });
+
+  } catch (err) {
+    console.error('No s\'ha pogut iniciar el PG listener new_order:', err?.message || err);
+    // No fem throw perquè el poll existent segueixi funcionant com a fallback.
+  }
+})();
+
 
 /* ───────── Bot UI ───────── */
 admin.start((ctx) => {
@@ -294,3 +366,4 @@ admin.catch((err, ctx) => { console.error('Admin bot error', err); try { ctx.rep
 admin.launch().then(() => console.log('Admin bot running'));
 process.once('SIGINT', () => admin.stop('SIGINT'));
 process.once('SIGTERM', () => admin.stop('SIGTERM'));
+

@@ -662,30 +662,6 @@ async function finalizeOrder(ctx) {
     payment_provider: 'paypal',
     payment_status: 'UNPAID'
   });
-// ---------- NOTIFY Postgres per avisar admin_bot immediatament (ESM-safe) ----------
-try {
-  const payload = JSON.stringify({ orderId: row.id });
-
-  // Si tens pool exportat a db (reutilitza la pool de l'app si existeix)
-  if (db && db.pool && typeof db.pool.query === 'function') {
-    await db.pool.query('SELECT pg_notify($1, $2)', ['new_order', payload]);
-  } else {
-    // Dynamic import per entorns ESM (no usem require)
-    const pgMod = await import('pg');
-    // compatibilitats CommonJS/ESM: Pool pot estar a pgMod.Pool o a pgMod.default.Pool
-    const Pool = pgMod.Pool || (pgMod.default && pgMod.default.Pool);
-    if (!Pool) throw new Error('No s\'ha trobat Pool a la llibreria pg');
-    const tempPool = new Pool({
-      connectionString: process.env.DATABASE_URL,
-      ssl: process.env.PGSSLMODE === 'require' ? { rejectUnauthorized: false } : false,
-    });
-    await tempPool.query('SELECT pg_notify($1, $2)', ['new_order', payload]);
-    await tempPool.end();
-  }
-} catch (err) {
-  console.error('Error fent pg_notify(new_order):', err?.message || err);
-}
-// ---------- fi NOTIFY ----------
 
   const orderId = row?.id;
 
@@ -779,7 +755,6 @@ if (USE_WEBHOOK) {
         payment_id: token,
         payment_receipt_json: capture,
         paid_at: paid ? new Date().toISOString() : null,
-        notified_at: paid ? new Date().toISOString() : null // evitem dobles avisos
       });
 
       const o = await db.getOrderById(orderId);
@@ -792,16 +767,6 @@ if (USE_WEBHOOK) {
       } catch {}
 
       // admin NOMÉS si pagada
-      if (paid) await notifyAdminsOfOrder(o);
-
-      res.setHeader('Content-Type', 'text/html; charset=utf-8');
-      res.end(`
-        <html><body style="font-family: sans-serif; text-align:center; padding:40px">
-          <h2>${paid ? 'Pagament completat ✅' : 'Pagament no completat'}</h2>
-          <p>Comanda #${orderId}</p>
-          <p>Pots tornar a Telegram.</p>
-        </body></html>
-      `);
     } catch (e) {
       console.error('paypal/return error:', e.message);
       res.status(500).send('Error processant el retorn de PayPal.');
@@ -879,9 +844,17 @@ if (USE_WEBHOOK) {
               paid_at: paid ? new Date().toISOString() : null
             });
             const updated = await db.getOrderById(our.id);
-            if (paid && !updated.notified_at) {
-              await notifyAdminsOfOrder(updated);
-              await db.setOrderPaymentInfo(updated.id, { notified_at: new Date().toISOString() });
+            // --- Nou: notificar l'admin-bot via Postgres (només després de pagament)
+if (paid) {
+  try {
+    const orderId = updated.id; // o our.id segons el teu context
+    const payload = JSON.stringify({ orderId });
+    await pool.query('SELECT pg_notify($1, $2)', ['new_order', payload]);
+  } catch (err) {
+    console.error('Error fent pg_notify(new_order) després del pagament:', err?.message || err);
+  }
+}
+
             }
           }
         }
@@ -986,6 +959,7 @@ bot.on('text', async (ctx) => {
 
 process.once('SIGINT', () => { try { bot.stop('SIGINT'); } catch {} });
 process.once('SIGTERM', () => { try { bot.stop('SIGTERM'); } catch {} });
+
 
 
 

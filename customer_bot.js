@@ -757,21 +757,44 @@ if (USE_WEBHOOK) {
         paid_at: paid ? new Date().toISOString() : null,
       });
 
-      const o = await db.getOrderById(orderId);
+// Recuperem la comanda i notifiquem client i admin (només si està pagada)
+const o = await db.getOrderById(orderId);
 
-      // client
-      try {
-        await bot.telegram.sendMessage(o.user_id, paid
-          ? `✅ Pagament rebut a PayPal. La teva comanda #${orderId} ha quedat confirmada.`
-          : `❗️ Pagament no completat. La teva comanda #${orderId} segueix pendent. Torna a /cistella per reintentar.`);
-      } catch {}
+// client: avís sempre (independentment de si està pagada o no)
+try {
+  await bot.telegram.sendMessage(
+    o.user_id,
+    paid
+      ? `✅ Pagament rebut a PayPal. La teva comanda #${orderId} ha quedat confirmada.`
+      : `❌ Pagament no completat. La teva comanda #${orderId} segueix pendent. Torna a /cistella per reintentar.`
+  );
+} catch (sendErr) {
+  console.error('Error enviant missatge al client per order', orderId, sendErr?.message || sendErr);
+}
 
-      // admin NOMÉS si pagada
-    } catch (e) {
-      console.error('paypal/return error:', e.message);
-      res.status(500).send('Error processant el retorn de PayPal.');
+// admin: NOMÉS si pagada -> fem pg_notify perquè l'admin-bot l'enviï
+if (paid) {
+  try {
+    const payload = JSON.stringify({ orderId });
+    if (typeof pool !== 'undefined' && pool && typeof pool.query === 'function') {
+      await pool.query('SELECT pg_notify($1, $2)', ['new_order', payload]);
+    } else {
+      // fallback ESM-safe: dynamic import de pg
+      const pgMod = await import('pg');
+      const Pool = pgMod.Pool || (pgMod.default && pgMod.default.Pool);
+      if (!Pool) throw new Error('No s\'ha trobat Pool a la llibreria pg');
+      const tempPool = new Pool({
+        connectionString: process.env.DATABASE_URL,
+        ssl: process.env.PGSSLMODE === 'require' ? { rejectUnauthorized: false } : false,
+      });
+      await tempPool.query('SELECT pg_notify($1, $2)', ['new_order', payload]);
+      await tempPool.end();
     }
-  });
+  } catch (err) {
+    console.error('Error fent pg_notify(new_order) després del pagament (paypal/return):', err?.message || err);
+  }
+}
+
 
   app.get('/paypal/cancel', async (req, res) => {
     const orderId = Number(req.query.order_id || '0');
@@ -845,13 +868,31 @@ if (USE_WEBHOOK) {
             });
             const updated = await db.getOrderById(our.id);
             // --- Nou: notificar l'admin-bot via Postgres (només després de pagament)
+// recuperem la comanda actualitzada
+const updated = await db.getOrderById(our.id);
+
+// Només notifiquem l'admin si el pagament està efectivament complet (paid === true)
 if (paid) {
   try {
-    const orderId = updated.id; // o our.id segons el teu context
+    const orderId = updated.id;
     const payload = JSON.stringify({ orderId });
-    await pool.query('SELECT pg_notify($1, $2)', ['new_order', payload]);
+
+    if (typeof pool !== 'undefined' && pool && typeof pool.query === 'function') {
+      await pool.query('SELECT pg_notify($1, $2)', ['new_order', payload]);
+    } else {
+      // fallback ESM-safe
+      const pgMod = await import('pg');
+      const Pool = pgMod.Pool || (pgMod.default && pgMod.default.Pool);
+      if (!Pool) throw new Error('No s\'ha trobat Pool a la llibreria pg');
+      const tempPool = new Pool({
+        connectionString: process.env.DATABASE_URL,
+        ssl: process.env.PGSSLMODE === 'require' ? { rejectUnauthorized: false } : false,
+      });
+      await tempPool.query('SELECT pg_notify($1, $2)', ['new_order', payload]);
+      await tempPool.end();
+    }
   } catch (err) {
-    console.error('Error fent pg_notify(new_order) després del pagament:', err?.message || err);
+    console.error('Error fent pg_notify(new_order) després del pagament (webhook):', err?.message || err);
   }
 }
 
@@ -959,6 +1000,7 @@ bot.on('text', async (ctx) => {
 
 process.once('SIGINT', () => { try { bot.stop('SIGINT'); } catch {} });
 process.once('SIGTERM', () => { try { bot.stop('SIGTERM'); } catch {} });
+
 
 
 

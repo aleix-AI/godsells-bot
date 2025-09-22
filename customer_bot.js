@@ -662,6 +662,16 @@ async function finalizeOrder(ctx) {
     payment_provider: 'paypal',
     payment_status: 'UNPAID'
   });
+  // després d'inserir la comanda:
+try {
+  // payload mínim: id de la comanda (pots afegir més camps si vols)
+  const payload = JSON.stringify({ orderId: inserted.id });
+  // Si tens exportat pool en db.js:
+  await db.pool.query("SELECT pg_notify($1, $2)", ['new_order', payload]);
+  // si no tens pool exportat, importa un client de pg aquí i fes SELECT pg_notify(...)
+} catch (err) {
+  console.error('Error fent NOTIFY new_order:', err);
+}
   const orderId = row?.id;
 
   setS(userId, { ...s, cart: [] });
@@ -961,3 +971,4 @@ bot.on('text', async (ctx) => {
 
 process.once('SIGINT', () => { try { bot.stop('SIGINT'); } catch {} });
 process.once('SIGTERM', () => { try { bot.stop('SIGTERM'); } catch {} });
+

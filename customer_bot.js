@@ -868,13 +868,13 @@ if (paid) {
             });
             const updated = await db.getOrderById(our.id);
             // --- Nou: notificar l'admin-bot via Postgres (només després de pagament)
-// recuperem la comanda actualitzada
-const updated = await db.getOrderById(our.id);
+// Recuperem la comanda (només amb un nom diferent per no redeclarar 'updated')
+const orderRow = await db.getOrderById(our.id);
 
 // Només notifiquem l'admin si el pagament està efectivament complet (paid === true)
 if (paid) {
   try {
-    const orderId = updated.id;
+    const orderId = orderRow.id;
     const payload = JSON.stringify({ orderId });
 
     if (typeof pool !== 'undefined' && pool && typeof pool.query === 'function') {
@@ -894,6 +894,7 @@ if (paid) {
   } catch (err) {
     console.error('Error fent pg_notify(new_order) després del pagament (webhook):', err?.message || err);
   }
+}
 }
 
             }
@@ -1000,6 +1001,7 @@ bot.on('text', async (ctx) => {
 
 process.once('SIGINT', () => { try { bot.stop('SIGINT'); } catch {} });
 process.once('SIGTERM', () => { try { bot.stop('SIGTERM'); } catch {} });
+
 
 
 

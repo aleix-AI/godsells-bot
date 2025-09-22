@@ -662,16 +662,28 @@ async function finalizeOrder(ctx) {
     payment_provider: 'paypal',
     payment_status: 'UNPAID'
   });
-  // després d'inserir la comanda:
+// ---------- NOTIFY Postgres per avisar admin_bot immediatament (CORREGIT) ----------
 try {
-  // payload mínim: id de la comanda (pots afegir més camps si vols)
-  const payload = JSON.stringify({ orderId: inserted.id });
-  // Si tens exportat pool en db.js:
-  await db.pool.query("SELECT pg_notify($1, $2)", ['new_order', payload]);
-  // si no tens pool exportat, importa un client de pg aquí i fes SELECT pg_notify(...)
+  const payload = JSON.stringify({ orderId: row.id });
+
+  // Si tens pool exportat en db (reutilitza la pool si existeix)
+  if (db && db.pool && typeof db.pool.query === 'function') {
+    await db.pool.query('SELECT pg_notify($1, $2)', ['new_order', payload]);
+  } else {
+    // Si no hi ha pool compartida, fem una conexió temporal i la tanquem
+    const { Pool } = require('pg');
+    const tempPool = new Pool({
+      connectionString: process.env.DATABASE_URL,
+      ssl: process.env.PGSSLMODE === 'require' ? ({ rejectUnauthorized: false }) : false,
+    });
+    await tempPool.query('SELECT pg_notify($1, $2)', ['new_order', payload]);
+    await tempPool.end();
+  }
 } catch (err) {
-  console.error('Error fent NOTIFY new_order:', err);
+  console.error('Error fent pg_notify(new_order):', err?.message || err);
 }
+// ---------- fi NOTIFY ----------
+
   const orderId = row?.id;
 
   setS(userId, { ...s, cart: [] });
@@ -971,4 +983,5 @@ bot.on('text', async (ctx) => {
 
 process.once('SIGINT', () => { try { bot.stop('SIGINT'); } catch {} });
 process.once('SIGTERM', () => { try { bot.stop('SIGTERM'); } catch {} });
+
 

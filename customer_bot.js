@@ -757,7 +757,7 @@ if (USE_WEBHOOK) {
         paid_at: paid ? new Date().toISOString() : null,
       });
 
-// Recuperem la comanda i notifiquem client i admin (només si està pagada)
+// Recuperem la comanda i notifiquem client i admin (només després de pagament)
 const o = await db.getOrderById(orderId);
 
 // client: avís sempre (independentment de si està pagada o no)
@@ -794,7 +794,6 @@ if (paid) {
     console.error('Error fent pg_notify(new_order) després del pagament (paypal/return):', err?.message || err);
   }
 }
-
 
   app.get('/paypal/cancel', async (req, res) => {
     const orderId = Number(req.query.order_id || '0');
@@ -910,19 +909,33 @@ if (paid) {
 
         if (ppOrderId) {
           const our = await findOurOrderByPayPalOrderId(ppOrderId);
-          if (our && our.payment_status !== 'PAID') {
-            await db.setOrderPaymentInfo(our.id, {
-              payment_status: 'PAID',
-              payment_id: ppOrderId,
-              payment_receipt_json: capture,
-              paid_at: new Date().toISOString()
-            });
-            const updated = await db.getOrderById(our.id);
-            if (!updated.notified_at) {
-              await notifyAdminsOfOrder(updated);
-              await db.setOrderPaymentInfo(updated.id, { notified_at: new Date().toISOString() });
-            }
-          }
+          // Recuperem la comanda (uso orderRow per evitar redeclaracions)
+const orderRow = await db.getOrderById(our.id);
+
+// Només notifiquem l'admin si el pagament està efectivament complet (paid === true)
+if (paid) {
+  try {
+    const orderId = orderRow.id;
+    const payload = JSON.stringify({ orderId });
+
+    if (typeof pool !== 'undefined' && pool && typeof pool.query === 'function') {
+      await pool.query('SELECT pg_notify($1, $2)', ['new_order', payload]);
+    } else {
+      // fallback ESM-safe
+      const pgMod = await import('pg');
+      const Pool = pgMod.Pool || (pgMod.default && pgMod.default.Pool);
+      if (!Pool) throw new Error('No s\'ha trobat Pool a la llibreria pg');
+      const tempPool = new Pool({
+        connectionString: process.env.DATABASE_URL,
+        ssl: process.env.PGSSLMODE === 'require' ? { rejectUnauthorized: false } : false,
+      });
+      await tempPool.query('SELECT pg_notify($1, $2)', ['new_order', payload]);
+      await tempPool.end();
+    }
+  } catch (err) {
+    console.error('Error fent pg_notify(new_order) després del pagament (webhook):', err?.message || err);
+  }
+}
         }
       }
 
@@ -1001,6 +1014,7 @@ bot.on('text', async (ctx) => {
 
 process.once('SIGINT', () => { try { bot.stop('SIGINT'); } catch {} });
 process.once('SIGTERM', () => { try { bot.stop('SIGTERM'); } catch {} });
+
 
 
 

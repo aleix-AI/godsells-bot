@@ -90,10 +90,29 @@ function orderLine(o) {
   return `#${o.id} — ${when} — ${o.customer_name || o.username || o.user_id} — ${toEuro(o.total_cents)} — ${o.status}/${o.payment_status}`;
 }
 function orderButtons(o) {
+  // Mostrem botons segons l'estat actual
+  if (o.status === 'COMPLETED') {
+    return Markup.inlineKeyboard([
+      [
+        Markup.button.callback('Comanda realitzada ✅', 'NOOP'),
+        Markup.button.callback('Reemborsament 💸', `ORDER_REFUND_${o.id}`)
+      ]
+    ]);
+  }
+  if (o.status === 'REFUND_REQUESTED') {
+    return Markup.inlineKeyboard([
+      [
+        Markup.button.callback('Comanda realitzada ✅', 'NOOP'),
+        Markup.button.callback('Reemborsament sol·licitat ⏳', 'NOOP')
+      ]
+    ]);
+  }
+  // Estat per defecte (PENDING, etc.)
   return Markup.inlineKeyboard([
     [Markup.button.callback('✅ Marcar realitzada', `ORDER_DONE_${o.id}`)]
   ]);
 }
+
 function toAdminMsg(o) {
   return [
     `🆕 *COMANDA NOVA* (#${o.id}) — ${o.payment_status}`,
@@ -222,14 +241,28 @@ admin.hears('📊 Vendes (mes)', async (ctx) => {
   }
 });
 
+// Quan premen "Marcar realitzada"
 admin.action(/ORDER_DONE_(\d+)/, async (ctx) => {
   if (!isAdmin(ctx)) return ctx.answerCbQuery('No autoritzat');
   const id = Number(ctx.match[1]);
   await db.setStatus(id, 'COMPLETED');
   await ctx.answerCbQuery('Comanda marcada com realitzada');
   const o = await db.getOrder(id);
+  // refresquem text i botons segons el nou estat
   try { await ctx.editMessageText(orderLine(o), orderButtons(o)); } catch {}
 });
+
+// Quan premen "Reemborsament 💸"
+admin.action(/ORDER_REFUND_(\d+)/, async (ctx) => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery('No autoritzat');
+  const id = Number(ctx.match[1]);
+  await db.setStatus(id, 'REFUND_REQUESTED');
+  await ctx.answerCbQuery('Reemborsament sol·licitat');
+  const o = await db.getOrder(id);
+  // refresquem text i botons segons el nou estat
+  try { await ctx.editMessageText(orderLine(o), orderButtons(o)); } catch {}
+});
+
 
 admin.action('NOOP', (ctx) => ctx.answerCbQuery());
 
@@ -366,4 +399,5 @@ admin.catch((err, ctx) => { console.error('Admin bot error', err); try { ctx.rep
 admin.launch().then(() => console.log('Admin bot running'));
 process.once('SIGINT', () => admin.stop('SIGINT'));
 process.once('SIGTERM', () => admin.stop('SIGTERM'));
+
 

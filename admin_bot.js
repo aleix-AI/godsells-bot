@@ -15,17 +15,36 @@ if (!PAYPAL_CLIENT_ID || !PAYPAL_CLIENT_SECRET) {
 
 // Obtenir access token
 async function paypalAccessToken() {
-  const creds = Buffer.from(`${PAYPAL_CLIENT_ID}:${PAYPAL_CLIENT_SECRET}`).toString('base64');
+  if (!PAYPAL_CLIENT_ID || !PAYPAL_CLIENT_SECRET) {
+    throw new Error('Falten PAYPAL_CLIENT_ID / PAYPAL_CLIENT_SECRET');
+  }
+
+  const basic = Buffer.from(`${PAYPAL_CLIENT_ID}:${PAYPAL_CLIENT_SECRET}`).toString('base64');
+
+  // URLSearchParams assegura el x-www-form-urlencoded correcte
+  const body = new URLSearchParams({ grant_type: 'client_credentials' });
+
   const r = await fetch(`${PAYPAL_API_BASE}/v1/oauth2/token`, {
     method: 'POST',
-    headers: { 'Authorization': `Basic ${creds}`, 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: 'grant_type=client_credentials'
+    headers: {
+      'Authorization': `Basic ${basic}`,
+      'Accept': 'application/json'
+      // (no posem Content-Type manualment; fetch el posa automàticament per URLSearchParams)
+    },
+    body
   });
-  if (!r.ok) throw new Error(`PayPal token ${r.status}`);
+
+  // Log útil si falla per veure la causa exacta
+  if (!r.ok) {
+    const txt = await r.text().catch(() => '');
+    throw new Error(`PayPal token ${r.status} — ${txt || 'sense cos'}`);
+  }
+
   const j = await r.json();
   if (!j.access_token) throw new Error('PayPal sense access_token');
   return j.access_token;
 }
+
 
 // Fer refund d’un capture
 // amount opcional: { currency_code: 'EUR', value: 'xx.xx' }
@@ -495,6 +514,7 @@ admin.catch((err, ctx) => { console.error('Admin bot error', err); try { ctx.rep
 admin.launch().then(() => console.log('Admin bot running'));
 process.once('SIGINT', () => admin.stop('SIGINT'));
 process.once('SIGTERM', () => admin.stop('SIGTERM'));
+
 
 
 

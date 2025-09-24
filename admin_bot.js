@@ -5,21 +5,21 @@ import pkg from 'pg';
 const { Pool, Client } = pkg;
 // --- PAYPAL CONFIG ---
 const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID;
-const PAYPAL_CLIENT_SECRET = process.env.PAYPAL_CLIENT_SECRET;
+const PAYPAL_SECRET = process.env.PAYPAL_SECRET;
 // Usa "https://api-m.sandbox.paypal.com" per sandbox, o "https://api-m.paypal.com" per producció
 const PAYPAL_API_BASE = process.env.PAYPAL_API_BASE || 'https://api-m.sandbox.paypal.com';
 
-if (!PAYPAL_CLIENT_ID || !PAYPAL_CLIENT_SECRET) {
-  console.warn('⚠️ Falta PAYPAL_CLIENT_ID o PAYPAL_CLIENT_SECRET a les env vars; el reemborsament fallarà.');
+if (!PAYPAL_CLIENT_ID || !PAYPAL_SECRET) {
+  console.warn('⚠️ Falta PAYPAL_CLIENT_ID o PAYPAL_SECRET a les env vars; el reemborsament fallarà.');
 }
 
 // Obtenir access token
 async function paypalAccessToken() {
-  if (!PAYPAL_CLIENT_ID || !PAYPAL_CLIENT_SECRET) {
-    throw new Error('Falten PAYPAL_CLIENT_ID / PAYPAL_CLIENT_SECRET');
+  if (!PAYPAL_CLIENT_ID || !PAYPAL_SECRET) {
+    throw new Error('Falten PAYPAL_CLIENT_ID / PAYPAL_SECRET');
   }
 
-  const basic = Buffer.from(`${PAYPAL_CLIENT_ID}:${PAYPAL_CLIENT_SECRET}`).toString('base64');
+  const basic = Buffer.from(`${PAYPAL_CLIENT_ID}:${PAYPAL_SECRET}`).toString('base64');
 
   // URLSearchParams assegura el x-www-form-urlencoded correcte
   const body = new URLSearchParams({ grant_type: 'client_credentials' });
@@ -514,6 +514,7 @@ admin.catch((err, ctx) => { console.error('Admin bot error', err); try { ctx.rep
 admin.launch().then(() => console.log('Admin bot running'));
 process.once('SIGINT', () => admin.stop('SIGINT'));
 process.once('SIGTERM', () => admin.stop('SIGTERM'));
+
 
 
 

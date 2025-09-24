@@ -3,6 +3,64 @@ import 'dotenv/config';
 import { Telegraf, Markup } from 'telegraf';
 import pkg from 'pg';
 const { Pool, Client } = pkg;
+// --- PAYPAL CONFIG ---
+const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID;
+const PAYPAL_CLIENT_SECRET = process.env.PAYPAL_CLIENT_SECRET;
+// Usa "https://api-m.sandbox.paypal.com" per sandbox, o "https://api-m.paypal.com" per producció
+const PAYPAL_API_BASE = process.env.PAYPAL_API_BASE || 'https://api-m.sandbox.paypal.com';
+
+if (!PAYPAL_CLIENT_ID || !PAYPAL_CLIENT_SECRET) {
+  console.warn('⚠️ Falta PAYPAL_CLIENT_ID o PAYPAL_CLIENT_SECRET a les env vars; el reemborsament fallarà.');
+}
+
+// Obtenir access token
+async function paypalAccessToken() {
+  const creds = Buffer.from(`${PAYPAL_CLIENT_ID}:${PAYPAL_CLIENT_SECRET}`).toString('base64');
+  const r = await fetch(`${PAYPAL_API_BASE}/v1/oauth2/token`, {
+    method: 'POST',
+    headers: { 'Authorization': `Basic ${creds}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: 'grant_type=client_credentials'
+  });
+  if (!r.ok) throw new Error(`PayPal token ${r.status}`);
+  const j = await r.json();
+  if (!j.access_token) throw new Error('PayPal sense access_token');
+  return j.access_token;
+}
+
+// Fer refund d’un capture
+// amount opcional: { currency_code: 'EUR', value: 'xx.xx' }
+// Si no passes amount, PayPal farà refund total.
+async function paypalRefundCapture(captureId, amount) {
+  const access = await paypalAccessToken();
+  const r = await fetch(`${PAYPAL_API_BASE}/v2/payments/captures/${captureId}/refund`, {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${access}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(amount ? { amount } : {})
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    const msg = j?.details?.[0]?.issue || j?.name || `HTTP ${r.status}`;
+    throw new Error(`Refund error: ${msg}`);
+  }
+  return j; // conté refund id, status, etc.
+}
+
+// Extreure captureId i amount de la comanda guardada (sigui order o capture)
+function extractCaptureFromOrder(order) {
+  let receipt = order.payment_receipt_json;
+  try { if (typeof receipt === 'string') receipt = JSON.parse(receipt); } catch {}
+  const cap =
+    // cas webhook PAYMENT.CAPTURE.COMPLETED: receipt ja és el capture
+    (receipt && receipt.id && receipt.amount && receipt.status ? receipt : null) ||
+    // cas checkout: dins purchase_units[0].payments.captures[0]
+    receipt?.purchase_units?.[0]?.payments?.captures?.[0] ||
+    null;
+
+  const captureId = cap?.id || null;
+  const amount = cap?.amount || null; // {currency_code, value}
+  return { captureId, amount };
+}
+
 
 /* ───────── Config ───────── */
 const ADMIN_BOT_TOKEN = process.env.ADMIN_BOT_TOKEN;
@@ -90,7 +148,6 @@ function orderLine(o) {
   return `#${o.id} — ${when} — ${o.customer_name || o.username || o.user_id} — ${toEuro(o.total_cents)} — ${o.status}/${o.payment_status}`;
 }
 function orderButtons(o) {
-  // Mostrem botons segons l'estat actual
   if (o.status === 'COMPLETED') {
     return Markup.inlineKeyboard([
       [
@@ -107,11 +164,17 @@ function orderButtons(o) {
       ]
     ]);
   }
-  // Estat per defecte (PENDING, etc.)
+  if (o.status === 'REFUNDED') {
+    return Markup.inlineKeyboard([
+      [Markup.button.callback('Reemborsament fet ✅', 'NOOP')]
+    ]);
+  }
+  // Estat inicial (PENDING o altres)
   return Markup.inlineKeyboard([
     [Markup.button.callback('✅ Marcar realitzada', `ORDER_DONE_${o.id}`)]
   ]);
 }
+
 
 function toAdminMsg(o) {
   return [
@@ -245,11 +308,44 @@ admin.hears('📊 Vendes (mes)', async (ctx) => {
 admin.action(/ORDER_DONE_(\d+)/, async (ctx) => {
   if (!isAdmin(ctx)) return ctx.answerCbQuery('No autoritzat');
   const id = Number(ctx.match[1]);
-  await db.setStatus(id, 'COMPLETED');
-  await ctx.answerCbQuery('Comanda marcada com realitzada');
-  const o = await db.getOrder(id);
-  // refresquem text i botons segons el nou estat
-  try { await ctx.editMessageText(orderLine(o), orderButtons(o)); } catch {}
+  try {
+    await db.setStatus(id, 'COMPLETED');
+    await ctx.answerCbQuery('Comanda marcada com realitzada');
+    const o = await db.getOrder(id);
+    await ctx.editMessageReplyMarkup(orderButtons(o).reply_markup);
+  } catch (err) {
+    console.error('ORDER_DONE error', err);
+    await ctx.answerCbQuery('Error marcant', { show_alert: true });
+  }
+});
+admin.action(/ORDER_REFUND_(\d+)/, async (ctx) => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery('No autoritzat');
+  const id = Number(ctx.match[1]);
+  try {
+    const o = await db.getOrder(id);
+    if (!o) throw new Error('Comanda inexistent');
+
+    // Extreure captureId i amount de l’ordre
+    const { captureId, amount } = extractCaptureFromOrder(o);
+    if (!captureId) throw new Error('No s\'ha trobat cap captureId a payment_receipt_json');
+
+    // Opcional: si vols refund parcial, canvia amount.value
+    // Exemple parcial: const refund = await paypalRefundCapture(captureId, { currency_code: amount.currency_code || 'EUR', value: '1.00' });
+    const refund = await paypalRefundCapture(captureId, amount); // refund total per defecte
+
+    // Actualitza estat a la BD
+    if (db.setStatus) await db.setStatus(id, 'REFUND_REQUESTED'); // o 'REFUNDED' si vols tancar directe
+    // Si tens columnes per guardar el refund id/json, pots afegir una funció al teu db per persistir: refund_id = refund.id, refund_json = refund
+    // await db.setRefundInfo?.(id, { refund_id: refund.id, refund_receipt_json: refund });
+
+    await ctx.answerCbQuery('Reemborsament sol·licitat 💸');
+    const updated = await db.getOrder(id);
+    // Mostra “Reemborsament sol·licitat ⏳” o “Reemborsament fet ✅” segons l’estat que vulguis deixar
+    await ctx.editMessageReplyMarkup(orderButtons(updated).reply_markup);
+  } catch (err) {
+    console.error('ORDER_REFUND error', err);
+    await ctx.answerCbQuery(`Error reemborsant: ${err.message}`, { show_alert: true });
+  }
 });
 
 // Quan premen "Reemborsament 💸"
@@ -399,5 +495,6 @@ admin.catch((err, ctx) => { console.error('Admin bot error', err); try { ctx.rep
 admin.launch().then(() => console.log('Admin bot running'));
 process.once('SIGINT', () => admin.stop('SIGINT'));
 process.once('SIGTERM', () => admin.stop('SIGTERM'));
+
 
 

@@ -792,8 +792,17 @@ if (paid) {
     }
   } catch (err) {
     console.error('Error fent pg_notify(new_order) després del pagament (paypal/return):', err?.message || err);
+        } // fi del try intern del pg_notify
+
+  } catch (e) {
+    console.error('paypal/return error:', e?.message || e);
+    // Retornem error HTML amigable perquè l'usuari PayPal vegi que hi ha hagut un problema
+    res.status(500).send('Error processing the PayPal return.');
+    return;
   }
-}
+}); // <-- tanca el app.get('/paypal/return'...
+
+  }
 
   app.get('/paypal/cancel', async (req, res) => {
     const orderId = Number(req.query.order_id || '0');
@@ -909,6 +918,9 @@ if (paid) {
 
         if (ppOrderId) {
           const our = await findOurOrderByPayPalOrderId(ppOrderId);
+          // Aquest event representa una captura completada -- marquem 'paid'
+const paid = (capture?.status === 'COMPLETED') || true;
+
           // Recuperem la comanda (uso orderRow per evitar redeclaracions)
 const orderRow = await db.getOrderById(our.id);
 
@@ -1014,6 +1026,7 @@ bot.on('text', async (ctx) => {
 
 process.once('SIGINT', () => { try { bot.stop('SIGINT'); } catch {} });
 process.once('SIGTERM', () => { try { bot.stop('SIGTERM'); } catch {} });
+
 
 
 

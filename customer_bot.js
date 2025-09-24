@@ -860,9 +860,13 @@ if (USE_WEBHOOK) {
       const type = event.event_type;
 
       async function findOurOrderByPayPalOrderId(ppOrderId) {
-        return (await pool.query(`SELECT * FROM orders WHERE payment_id=$1 ORDER BY id DESC LIMIT 1`, [ppOrderId])).rows[0];
+        return (await pool.query(
+          `SELECT * FROM orders WHERE payment_id=$1 ORDER BY id DESC LIMIT 1`,
+          [ppOrderId]
+        )).rows[0];
       }
 
+      // --- CHECKOUT.ORDER.APPROVED
       if (type === 'CHECKOUT.ORDER.APPROVED') {
         const ppOrderId = event.resource?.id;
         if (ppOrderId) {
@@ -871,93 +875,91 @@ if (USE_WEBHOOK) {
             const cap = await paypalCaptureOrder(ppOrderId);
             const paid = (cap?.status === 'COMPLETED') ||
                          (cap?.purchase_units?.[0]?.payments?.captures?.[0]?.status === 'COMPLETED');
+
             await db.setOrderPaymentInfo(our.id, {
               payment_status: paid ? 'PAID' : 'UNPAID',
               payment_id: ppOrderId,
               payment_receipt_json: cap,
-              paid_at: paid ? new Date().toISOString() : null
+              paid_at: paid ? new Date().toISOString() : null,
+              notified_at: null
             });
-            const updated = await db.getOrderById(our.id);
-            // --- Nou: notificar l'admin-bot via Postgres (només després de pagament)
-// Recuperem la comanda (només amb un nom diferent per no redeclarar 'updated')
-const orderRow = await db.getOrderById(our.id);
 
-// Només notifiquem l'admin si el pagament està efectivament complet (paid === true)
-if (paid) {
-  try {
-    const orderId = orderRow.id;
-    const payload = JSON.stringify({ orderId });
-
-    if (typeof pool !== 'undefined' && pool && typeof pool.query === 'function') {
-      await pool.query('SELECT pg_notify($1, $2)', ['new_order', payload]);
-    } else {
-      // fallback ESM-safe
-      const pgMod = await import('pg');
-      const Pool = pgMod.Pool || (pgMod.default && pgMod.default.Pool);
-      if (!Pool) throw new Error('No s\'ha trobat Pool a la llibreria pg');
-      const tempPool = new Pool({
-        connectionString: process.env.DATABASE_URL,
-        ssl: process.env.PGSSLMODE === 'require' ? { rejectUnauthorized: false } : false,
-      });
-      await tempPool.query('SELECT pg_notify($1, $2)', ['new_order', payload]);
-      await tempPool.end();
-    }
-  } catch (err) {
-    console.error('Error fent pg_notify(new_order) després del pagament (webhook):', err?.message || err);
-  }
-}
-}
-
+            const updatedOrder = await db.getOrderById(our.id);
+            if (paid && !updatedOrder.notified_at) {
+              // Notify admin-bot via Postgres NOTIFY (admin-bot fa LISTEN new_order)
+              try {
+                const payload = JSON.stringify({ orderId: updatedOrder.id });
+                if (typeof pool !== 'undefined' && pool && typeof pool.query === 'function') {
+                  await pool.query('SELECT pg_notify($1, $2)', ['new_order', payload]);
+                } else {
+                  const pgMod = await import('pg');
+                  const Pool = pgMod.Pool || (pgMod.default && pgMod.default.Pool);
+                  if (!Pool) throw new Error('No s\'ha trobat Pool a la llibreria pg');
+                  const tempPool = new Pool({
+                    connectionString: process.env.DATABASE_URL,
+                    ssl: process.env.PGSSLMODE === 'require' ? { rejectUnauthorized: false } : false,
+                  });
+                  await tempPool.query('SELECT pg_notify($1, $2)', ['new_order', payload]);
+                  await tempPool.end();
+                }
+              } catch (err) {
+                console.error('Error fent pg_notify(new_order) després del pagament (webhook):', err?.message || err);
+              }
             }
           }
         }
       }
 
+      // --- PAYMENT.CAPTURE.COMPLETED
       if (type === 'PAYMENT.CAPTURE.COMPLETED') {
         const capture = event.resource;
         const ppOrderId =
-          capture?.supplementary_data?.related_ids?.order_id
-          || (capture?.links || []).find(l => l.rel === 'up')?.href?.split('/')?.pop();
+          capture?.supplementary_data?.related_ids?.order_id ||
+          (capture?.links || []).find(l => l.rel === 'up')?.href?.split('/')?.pop();
 
         if (ppOrderId) {
           const our = await findOurOrderByPayPalOrderId(ppOrderId);
-          // Aquest event representa una captura completada -- marquem 'paid'
-const paid = (capture?.status === 'COMPLETED') || true;
+          if (our && our.payment_status !== 'PAID') {
+            // mark paid and save receipt
+            await db.setOrderPaymentInfo(our.id, {
+              payment_status: 'PAID',
+              payment_id: ppOrderId,
+              payment_receipt_json: capture,
+              paid_at: new Date().toISOString(),
+              notified_at: null
+            });
 
-          // Recuperem la comanda (uso orderRow per evitar redeclaracions)
-const orderRow = await db.getOrderById(our.id);
-
-// Només notifiquem l'admin si el pagament està efectivament complet (paid === true)
-if (paid) {
-  try {
-    const orderId = orderRow.id;
-    const payload = JSON.stringify({ orderId });
-
-    if (typeof pool !== 'undefined' && pool && typeof pool.query === 'function') {
-      await pool.query('SELECT pg_notify($1, $2)', ['new_order', payload]);
-    } else {
-      // fallback ESM-safe
-      const pgMod = await import('pg');
-      const Pool = pgMod.Pool || (pgMod.default && pgMod.default.Pool);
-      if (!Pool) throw new Error('No s\'ha trobat Pool a la llibreria pg');
-      const tempPool = new Pool({
-        connectionString: process.env.DATABASE_URL,
-        ssl: process.env.PGSSLMODE === 'require' ? { rejectUnauthorized: false } : false,
-      });
-      await tempPool.query('SELECT pg_notify($1, $2)', ['new_order', payload]);
-      await tempPool.end();
-    }
-  } catch (err) {
-    console.error('Error fent pg_notify(new_order) després del pagament (webhook):', err?.message || err);
-  }
-}
+            const updatedOrder = await db.getOrderById(our.id);
+            if (!updatedOrder.notified_at) {
+              try {
+                const payload = JSON.stringify({ orderId: updatedOrder.id });
+                if (typeof pool !== 'undefined' && pool && typeof pool.query === 'function') {
+                  await pool.query('SELECT pg_notify($1, $2)', ['new_order', payload]);
+                } else {
+                  const pgMod = await import('pg');
+                  const Pool = pgMod.Pool || (pgMod.default && pgMod.default.Pool);
+                  if (!Pool) throw new Error('No s\'ha trobat Pool a la llibreria pg');
+                  const tempPool = new Pool({
+                    connectionString: process.env.DATABASE_URL,
+                    ssl: process.env.PGSSLMODE === 'require' ? { rejectUnauthorized: false } : false,
+                  });
+                  await tempPool.query('SELECT pg_notify($1, $2)', ['new_order', payload]);
+                  await tempPool.end();
+                }
+              } catch (err) {
+                console.error('Error fent pg_notify(new_order) després del pagament (webhook capture):', err?.message || err);
+              }
+            }
+          }
         }
       }
 
-      res.send('OK');
+      // Sempre respondre OK per evitar reintents si tot ha anat bé
+      return res.send('OK');
     } catch (e) {
-      console.error('paypal/webhook error:', e.message);
-      res.status(200).send('OK'); // Respondre 200 per evitar reintents continus
+      console.error('paypal/webhook error:', e?.message || e);
+      // Respondre 200/OK per evitar que PayPal faci reintents constants si hem fallat
+      return res.status(200).send('OK');
     }
   });
 
@@ -1029,6 +1031,7 @@ bot.on('text', async (ctx) => {
 
 process.once('SIGINT', () => { try { bot.stop('SIGINT'); } catch {} });
 process.once('SIGTERM', () => { try { bot.stop('SIGTERM'); } catch {} });
+
 
 
 

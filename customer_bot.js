@@ -741,68 +741,71 @@ if (USE_WEBHOOK) {
   const express = (await import('express')).default;
   const app = express();
 
-  app.get('/paypal/return', async (req, res) => {
-    try {
-      const token = String(req.query.token || '');        // PayPal order id
-      const orderId = Number(req.query.order_id || '0');  // nostra order id
-      if (!token || !orderId) throw new Error('Paràmetres invàlids');
-
-      const capture = await paypalCaptureOrder(token);
-      const paid = (capture?.status === 'COMPLETED') || (capture?.purchase_units?.[0]?.payments?.captures?.[0]?.status === 'COMPLETED');
-
-      await db.setOrderPaymentInfo(orderId, {
-        payment_status: paid ? 'PAID' : 'UNPAID',
-        payment_id: token,
-        payment_receipt_json: capture,
-        paid_at: paid ? new Date().toISOString() : null,
-      });
-
-// Recuperem la comanda i notifiquem client i admin (només després de pagament)
-const o = await db.getOrderById(orderId);
-
-// client: avís sempre (independentment de si està pagada o no)
-try {
-  await bot.telegram.sendMessage(
-    o.user_id,
-    paid
-      ? `✅ Pagament rebut a PayPal. La teva comanda #${orderId} ha quedat confirmada.`
-      : `❌ Pagament no completat. La teva comanda #${orderId} segueix pendent. Torna a /cistella per reintentar.`
-  );
-} catch (sendErr) {
-  console.error('Error enviant missatge al client per order', orderId, sendErr?.message || sendErr);
-}
-
-// admin: NOMÉS si pagada -> fem pg_notify perquè l'admin-bot l'enviï
-if (paid) {
+ app.get('/paypal/return', async (req, res) => {
   try {
-    const payload = JSON.stringify({ orderId });
-    if (typeof pool !== 'undefined' && pool && typeof pool.query === 'function') {
-      await pool.query('SELECT pg_notify($1, $2)', ['new_order', payload]);
-    } else {
-      // fallback ESM-safe: dynamic import de pg
-      const pgMod = await import('pg');
-      const Pool = pgMod.Pool || (pgMod.default && pgMod.default.Pool);
-      if (!Pool) throw new Error('No s\'ha trobat Pool a la llibreria pg');
-      const tempPool = new Pool({
-        connectionString: process.env.DATABASE_URL,
-        ssl: process.env.PGSSLMODE === 'require' ? { rejectUnauthorized: false } : false,
-      });
-      await tempPool.query('SELECT pg_notify($1, $2)', ['new_order', payload]);
-      await tempPool.end();
-    }
-  } catch (err) {
-    console.error('Error fent pg_notify(new_order) després del pagament (paypal/return):', err?.message || err);
-        } // fi del try intern del pg_notify
+    const token = String(req.query.token || '');        // PayPal order id
+    const orderId = Number(req.query.order_id || '0');  // nostra order id
+    if (!token || !orderId) throw new Error('Paràmetres invàlids');
 
+    const capture = await paypalCaptureOrder(token);
+    const paid = (capture?.status === 'COMPLETED') ||
+                 (capture?.purchase_units?.[0]?.payments?.captures?.[0]?.status === 'COMPLETED');
+
+    await db.setOrderPaymentInfo(orderId, {
+      payment_status: paid ? 'PAID' : 'UNPAID',
+      payment_id: token,
+      payment_receipt_json: capture,
+      paid_at: paid ? new Date().toISOString() : null,
+      notified_at: null // no marcar aquí; l'admin-bot ho farà quan enviï la notificació
+    });
+
+    // Recuperem la comanda i notifiquem client i admin (només després de pagament)
+    const o = await db.getOrderById(orderId);
+
+    // client: avís sempre (independentment de si està pagada o no)
+    try {
+      await bot.telegram.sendMessage(
+        o.user_id,
+        paid
+          ? `✅ Pagament rebut a PayPal. La teva comanda #${orderId} ha quedat confirmada.`
+          : `❌ Pagament no completat. La teva comanda #${orderId} segueix pendent. Torna a /cistella per reintentar.`
+      );
+    } catch (sendErr) {
+      console.error('Error enviant missatge al client per order', orderId, sendErr?.message || sendErr);
+    }
+
+    // admin: NOMÉS si pagada -> fem pg_notify perquè l'admin-bot l'enviï
+    if (paid) {
+      try {
+        const payload = JSON.stringify({ orderId });
+        if (typeof pool !== 'undefined' && pool && typeof pool.query === 'function') {
+          await pool.query('SELECT pg_notify($1, $2)', ['new_order', payload]);
+        } else {
+          // fallback ESM-safe: dynamic import de pg
+          const pgMod = await import('pg');
+          const Pool = pgMod.Pool || (pgMod.default && pgMod.default.Pool);
+          if (!Pool) throw new Error('No s\'ha trobat Pool a la llibreria pg');
+          const tempPool = new Pool({
+            connectionString: process.env.DATABASE_URL,
+            ssl: process.env.PGSSLMODE === 'require' ? { rejectUnauthorized: false } : false,
+          });
+          await tempPool.query('SELECT pg_notify($1, $2)', ['new_order', payload]);
+          await tempPool.end();
+        }
+      } catch (err) {
+        console.error('Error fent pg_notify(new_order) després del pagament (paypal/return):', err?.message || err);
+      }
+    }
+
+    // Opcional: enviar una resposta al navegador/PayPal. Ajusta si tens una pàgina client.
+    // Si tens una pàgina de confirmació, fes res.redirect('/gracies') o similar.
+    return res.send('OK');
   } catch (e) {
     console.error('paypal/return error:', e?.message || e);
-    // Retornem error HTML amigable perquè l'usuari PayPal vegi que hi ha hagut un problema
     res.status(500).send('Error processing the PayPal return.');
     return;
   }
-}); // <-- tanca el app.get('/paypal/return'...
-
-  }
+});
 
   app.get('/paypal/cancel', async (req, res) => {
     const orderId = Number(req.query.order_id || '0');
@@ -1026,6 +1029,7 @@ bot.on('text', async (ctx) => {
 
 process.once('SIGINT', () => { try { bot.stop('SIGINT'); } catch {} });
 process.once('SIGTERM', () => { try { bot.stop('SIGTERM'); } catch {} });
+
 
 
 
